@@ -1,0 +1,206 @@
+{% extends "base.html" %} {% from "macros.jinja" import window_vars with context
+%} {% block page %}
+<div class="row q-col-gutter-md justify-center">
+  <div class="col-12 col-md-7 col-lg-6 q-gutter-y-md">
+    <!-- Header Card -->
+    <q-card class="q-pa-sm shadow-2">
+      <q-card-section>
+        <div class="row items-center no-wrap">
+          <div class="col-auto q-mr-md">
+            <q-avatar size="md" color="primary" text-color="white" icon="bolt"></q-avatar>
+          </div>
+          <div class="col">
+            <h5 class="q-my-none text-weight-bold">Lightning Goats</h5>
+            <p class="text-caption text-grey-7 q-mb-none">
+              IoT integration for automated goat feeding
+            </p>
+          </div>
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <!-- Settings Card -->
+    <q-card class="shadow-2">
+      <q-card-section>
+        <div class="row items-center q-mb-md">
+          <q-icon name="settings" size="sm" class="q-mr-sm text-primary"></q-icon>
+          <h6 class="q-my-none">Configuration</h6>
+        </div>
+
+        <q-form class="q-gutter-md">
+          <q-input filled dense v-model="settings.openhab_url" label="OpenHAB URL"
+            hint="e.g., http://192.168.1.100:8080">
+            <template v-slot:prepend>
+              <q-icon name="home"></q-icon>
+            </template>
+          </q-input>
+
+          <q-input filled dense v-model="settings.openhab_auth" label="OpenHAB Auth Token" type="password"
+            hint="Authentication token (optional)">
+            <template v-slot:prepend>
+              <q-icon name="key"></q-icon>
+            </template>
+          </q-input>
+
+          <q-input filled dense v-model="settings.openhab_feeder_rule_id" label="Feeder Rule ID"
+            hint="Default: 88bd9ec4de">
+            <template v-slot:prepend>
+              <q-icon name="code"></q-icon>
+            </template>
+          </q-input>
+
+          <div class="row q-col-gutter-sm">
+            <div class="col-12 col-sm-6">
+              <q-select filled dense v-model="settings.herd_wallet_id" :options="walletOptions" option-value="id"
+                option-label="name" emit-value map-options clearable label="Herd Wallet">
+                <template v-slot:prepend>
+                  <q-icon name="account_balance_wallet"></q-icon>
+                </template>
+              </q-select>
+            </div>
+            <div class="col-12 col-sm-6">
+              <q-input filled dense v-model.number="settings.feeder_trigger_sats" label="Trigger Amount (sats)"
+                type="number" min="1">
+                <template v-slot:prepend>
+                  <q-icon name="bolt"></q-icon>
+                </template>
+              </q-input>
+            </div>
+          </div>
+
+          <q-expansion-item icon="cloud" label="Weather Settings" header-class="text-grey-8">
+            <q-card>
+              <q-card-section class="q-pt-sm">
+                <q-input filled dense v-model="settings.weather_station_url" label="Weather Station URL"
+                  class="q-mb-sm">
+                  <template v-slot:prepend>
+                    <q-icon name="link"></q-icon>
+                  </template>
+                </q-input>
+
+                <q-toggle v-model="settings.weather_broadcast_enabled" label="Enable Weather Broadcasts" color="primary"
+                  dense></q-toggle>
+              </q-card-section>
+            </q-card>
+          </q-expansion-item>
+
+          <q-toggle v-model="settings.interface_messages_enabled" label="Enable Interface Messages" color="primary"
+            dense></q-toggle>
+
+          <div class="row q-mt-lg justify-end">
+            <q-btn flat color="grey" label="Reset" @click="loadSettings" class="q-mr-sm"></q-btn>
+            <q-btn unelevated color="primary" :loading="loading" @click="updateSettings" label="Save Changes"
+              icon="save"></q-btn>
+          </div>
+        </q-form>
+      </q-card-section>
+    </q-card>
+  </div>
+
+  <div class="col-12 col-md-5 col-lg-4 q-gutter-y-md">
+    <!-- Status Card -->
+    <q-card class="shadow-2">
+      <q-card-section>
+        <div class="row items-center justify-between q-mb-md">
+          <div class="row items-center">
+            <q-icon name="analytics" size="sm" class="q-mr-sm text-primary"></q-icon>
+            <h6 class="q-my-none">Live Status</h6>
+          </div>
+          <q-badge v-if="status.configured" color="positive" label="Active"></q-badge>
+          <q-badge v-else color="warning" label="Not Configured"></q-badge>
+        </div>
+
+        <div class="text-center q-py-md">
+          <div class="text-h4 text-weight-bold text-primary">
+            {% raw %}{{ status.balance_sats || 0 }}{% endraw %}
+            <span class="text-subtitle1 text-grey-6">sats</span>
+          </div>
+          <div class="text-caption text-grey">Current Balance</div>
+        </div>
+
+        <q-linear-progress :value="status.progress_percent / 100" color="primary" track-color="grey-3" size="15px"
+          rounded class="q-mt-sm">
+          <div class="absolute-full flex flex-center">
+            <q-badge color="transparent" text-color="white" :label="status.progress_percent + '%'"></q-badge>
+          </div>
+        </q-linear-progress>
+
+        <div class="row justify-between q-mt-xs text-caption text-grey">
+          <span>0 sats</span>
+          <span>Goal: {% raw %}{{ status.trigger_amount || 1000 }}{% endraw %} sats</span>
+        </div>
+
+        <q-separator class="q-my-md" inset></q-separator>
+
+        <q-list dense separator>
+          <q-item>
+            <q-item-section>
+              <q-item-label>Active Members</q-item-label>
+            </q-item-section>
+            <q-item-section side>
+              <q-badge color="secondary">{% raw %}{{ status.active_members || 0 }}{% endraw %}</q-badge>
+            </q-item-section>
+          </q-item>
+
+          <q-item>
+            <q-item-section>
+              <q-item-label>BTC Price</q-item-label>
+            </q-item-section>
+            <q-item-section side>
+              <div v-if="status.btc_price_usd">
+                ${% raw %}{{ formatPrice(status.btc_price_usd) }}{% endraw %}
+                <span :class="priceChangeColor" class="q-ml-xs text-caption">
+                  <q-icon :name="status.btc_24h_change > 0 ? 'arrow_upward' : 'arrow_downward'"></q-icon>
+                  {% raw %}{{ Math.abs(status.btc_24h_change).toFixed(2) }}{% endraw %}%
+                </span>
+              </div>
+              <span v-else>--</span>
+            </q-item-section>
+          </q-item>
+        </q-list>
+
+        <q-separator class="q-my-md"></q-separator>
+
+        <q-btn unelevated color="accent" icon="restaurant" label="Manual Feed"
+          class="full-width q-py-sm text-weight-bold" @click="triggerFeederDialog = true"
+          :disable="!status.configured"></q-btn>
+      </q-card-section>
+    </q-card>
+
+    <q-card v-if="!status.configured" class="bg-orange-1 text-white shadow-1">
+      <q-card-section class="row items-center">
+        <q-icon name="warning" class="text-orange q-mr-md" size="md"></q-icon>
+        <div class="text-grey-9">
+          <div class="text-weight-bold">Configuration Required</div>
+          <div class="text-caption">Configure settings to enable features.</div>
+        </div>
+      </q-card-section>
+    </q-card>
+  </div>
+</div>
+
+<!-- Manual Trigger Dialog -->
+<q-dialog v-model="triggerFeederDialog">
+  <q-card>
+    <q-card-section>
+      <div class="text-h6">Trigger Feeder</div>
+    </q-card-section>
+
+    <q-card-section class="q-pt-none">
+      Are you sure you want to manually trigger the feeder?
+
+      <q-checkbox v-model="triggerOverrideCheck" label="Bypass override check" class="q-mt-md" />
+    </q-card-section>
+
+    <q-card-actions align="right">
+      <q-btn flat label="Cancel" color="grey" v-close-popup />
+      <q-btn unelevated label="Trigger" color="primary" @click="triggerFeeder" :loading="triggerLoading" />
+    </q-card-actions>
+  </q-card>
+</q-dialog>
+{% endblock %}
+
+{% block scripts %}
+{{ window_vars(user) }}
+<script src="/lightning_goats/static/js/index.js"></script>
+{% endblock %}

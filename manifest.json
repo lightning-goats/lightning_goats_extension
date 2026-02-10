@@ -1,0 +1,6 @@
+{
+    "id": "lightning_goats",
+    "name": "Lightning Goats",
+    "version": "0.1.0",
+    "short_description": "IoT integration for automated goat feeding with Lightning Network payments"
+}
