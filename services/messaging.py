@@ -10,6 +10,18 @@ DEFAULT_WEBSOCKET_TOPIC = "cyberherd"
 INTERFACE_INFO_FALLBACK_MESSAGE = "Lightning Goats interface update available."
 
 
+async def _resolve_herd_wallet_id(user_id: Optional[str]) -> Optional[str]:
+    """Return the herd_wallet from cyberherd settings for the user, or None."""
+    if not user_id:
+        return None
+    try:
+        from lnbits.extensions.cyberherd.crud import get_settings as get_ch_settings
+        settings = await get_ch_settings(user_id)
+        return getattr(settings, "herd_wallet", None) if settings else None
+    except Exception:
+        return None
+
+
 async def _broadcast_websocket_message(topic: str, payload: Dict[str, Any]) -> bool:
     """Send a websocket payload using the cyberherd_messaging helper."""
 
@@ -51,25 +63,6 @@ async def _pick_template_content(category: str, user_id: Optional[str]) -> Optio
     except Exception as exc:
         logger.debug(f"Lightning Goats: failed reading templates for category '{category}': {exc}")
         return None
-
-
-async def _get_user_private_key(user_id: str) -> Optional[str]:
-    """Get the user's Nostr private key hex from CyberHerd settings.
-    
-    Args:
-        user_id: The LNbits user ID
-        
-    Returns:
-        The private key hex string, or None if not set
-    """
-    try:
-        from lnbits.extensions.cyberherd.crud import get_settings
-        settings = await get_settings(user_id)
-        if settings and hasattr(settings, 'nostr_private_key') and settings.nostr_private_key:
-            return str(settings.nostr_private_key)
-    except Exception as e:
-        logger.debug(f"Lightning Goats: Could not get private key hex for user {user_id}: {e}")
-    return None
 
 
 async def _resolve_websocket_topic(user_id: Optional[str]) -> str:
@@ -140,13 +133,10 @@ async def send_feeder_message(
     try:
         # Import CyberHerd messaging service
         from lnbits.extensions.cyberherd.services.messaging import publish_event_message
-        
-        # Get private key for Nostr publishing
-        private_key = await _get_user_private_key(user_id) if user_id else None
-        
+
         # Pick a random goat name
         goat_name = random.choice(DEFAULT_GOAT_NAMES)
-        
+
         # Prepare values for template rendering
         values = {
             "name": goat_name,
@@ -154,19 +144,20 @@ async def send_feeder_message(
             "difference": 0,
             "difference_message": f"{balance_sats} sats collected and distributed.",
         }
-        
+
         # Use CyberHerd's publish_event_message which handles templates + fallback
         websocket_topic = await _resolve_websocket_topic(user_id)
+        herd_wallet_id = await _resolve_herd_wallet_id(user_id)
         logger.info(f"Lightning Goats: publishing feeder_triggered message to topic {websocket_topic} for user {user_id}")
-        
+
         success = await publish_event_message(
             event_type="feeder_triggered",
             owner_user_id=user_id,
             values=values,
-            private_key=private_key,
             websocket_topic=websocket_topic,
+            wallet_id=herd_wallet_id,
         )
-        
+
         if success:
             logger.info(f"Lightning Goats: Successfully published feeder trigger message")
         else:
@@ -240,22 +231,19 @@ async def send_payment_received_message(
     try:
         # Import CyberHerd messaging service
         from lnbits.extensions.cyberherd.services.messaging import publish_event_message
-        
-        # Get private key for Nostr publishing
-        private_key = await _get_user_private_key(user_id) if user_id else None
-        
+
         # Pick a random goat name for the message
         goat_name = random.choice(DEFAULT_GOAT_NAMES)
-        
+
         # Calculate how many more sats needed
         difference = max(0, trigger_threshold - balance)
-        
+
         # Create difference message
         if difference > 0:
             difference_message = f"{difference} sats until feeder activation."
         else:
             difference_message = "Feeder ready!"
-        
+
         # Prepare values for template rendering
         values = {
             "name": goat_name,
@@ -263,17 +251,18 @@ async def send_payment_received_message(
             "difference": difference,
             "difference_message": difference_message,
         }
-        
+
         # Use CyberHerd's publish_event_message for unified handling
         websocket_topic = await _resolve_websocket_topic(user_id)
+        herd_wallet_id = await _resolve_herd_wallet_id(user_id)
         logger.info(f"Lightning Goats: publishing sats_received message to topic {websocket_topic} for user {user_id}")
-        
+
         success = await publish_event_message(
             event_type="sats_received",
             owner_user_id=user_id,
             values=values,
-            private_key=private_key,
             websocket_topic=websocket_topic,
+            wallet_id=herd_wallet_id,
         )
         
         if success:
