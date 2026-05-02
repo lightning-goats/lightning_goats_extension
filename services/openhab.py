@@ -5,6 +5,7 @@ from typing import Optional
 from loguru import logger
 
 from ..config import DEFAULT_OPENHAB_FEEDER_RULE_ID, DEFAULT_OPENHAB_FEEDER_OVERRIDE_ITEM
+from .url_validation import ensure_outbound_url_allowed
 
 
 class OpenHABService:
@@ -18,7 +19,7 @@ class OpenHABService:
             base_url: OpenHAB base URL (e.g., http://192.168.1.100:8080)
             auth_token: OpenHAB authentication token
         """
-        self.base_url = base_url.rstrip('/')
+        self.base_url = ensure_outbound_url_allowed(base_url, "OpenHAB URL").rstrip("/")
         self.auth = (auth_token, "")
         self._client: Optional[httpx.AsyncClient] = None
     
@@ -104,14 +105,28 @@ class OpenHABService:
             True if override is enabled, False otherwise
         """
         try:
-            state = await self.get_item_state(item_name)
-            is_enabled = state == "ON"
+            state = await self.get_feeder_override_state(item_name)
+            if state is None:
+                logger.warning("Feeder override state is unknown; failing closed")
+                return True
+            is_enabled = state
             if is_enabled:
                 logger.info("Feeder override is enabled")
             return is_enabled
         except Exception as e:
             logger.error(f"Error checking feeder override: {e}")
-            return False
+            return True
+
+    async def get_feeder_override_state(
+        self,
+        item_name: str = DEFAULT_OPENHAB_FEEDER_OVERRIDE_ITEM,
+    ) -> Optional[bool]:
+        """Return override state, or None when it cannot be determined."""
+
+        state = await self.get_item_state(item_name)
+        if state is None:
+            return None
+        return state == "ON"
     
     async def close(self):
         """Close HTTP client."""

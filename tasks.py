@@ -36,6 +36,7 @@ from .services.messaging import (
     send_weather_message,
 )
 from .services.weather import fetch_weather_data
+from .services.url_validation import OutboundURLPolicyError, ensure_outbound_url_allowed
 from .config import (
     DEFAULT_WEATHER_BROADCAST_INTERVAL,
     DEFAULT_WEATHER_BROADCAST_PROBABILITY,
@@ -56,9 +57,15 @@ def _coerce_hex(value: Any) -> Optional[str]:
         v = value.strip().lower()
         if v.startswith("0x"):
             v = v[2:]
-        # If it's wrapped like "preimage: <hex>"
-        v = v.split()[-1] if " " in v and all(c in "0123456789abcdefx:" for c in v.replace(" ", "")) else v
-        return v
+        # If it's wrapped like "preimage: <hex>", take the last whitespace-delimited token
+        if " " in v:
+            candidate = v.split()[-1]
+            if all(c in "0123456789abcdef" for c in candidate):
+                v = candidate
+        # Validate result contains only hex characters
+        if v and all(c in "0123456789abcdef" for c in v):
+            return v
+        return None
     if isinstance(value, dict):
         for k in ("preimage", "payment_preimage", "paymentProof", "proof", "r_preimage"):
             if k in value:
@@ -254,9 +261,7 @@ async def _handle_payment(payment: Any) -> None:
     claimed_payment_hash: Optional[str] = None
     payment_failed: bool = False
     try:
-        logger.info(
-            f"🎯 Lightning Goats: PAYMENT EVENT RECEIVED\n"
-        )
+        logger.info("Lightning Goats: payment event received")
         logger.info(
             f"💰 Payment Details:\n"
             f"   • Wallet ID: {payment.wallet_id}\n"
@@ -279,6 +284,9 @@ async def _handle_payment(payment: Any) -> None:
         settings = await get_settings(wallet.user)
         if not settings:
             logger.debug(f"Lightning Goats: no settings for user {wallet.user}")
+            return
+        if not getattr(settings, "openhab_url", None):
+            logger.debug(f"Lightning Goats: OpenHAB URL not configured for user {wallet.user}")
             return
         
         # Check if this payment is for the configured herd wallet
@@ -400,19 +408,22 @@ async def _handle_payment(payment: Any) -> None:
         
         # Initialize OpenHAB service
         openhab = OpenHABService(settings.openhab_url, settings.openhab_auth)
+        processing_succeeded = False
         
         try:
+            # Check override state once for use in feeder and messaging decisions
+            override_enabled = await openhab.is_feeder_override_enabled()
+
             # Check if we should trigger feeder
             if balance_sats >= settings.feeder_trigger_sats:
                 logger.info(f"Lightning Goats: feeder trigger threshold reached ({balance_sats} >= {settings.feeder_trigger_sats})")
-                
-                # Check override
-                if await openhab.is_feeder_override_enabled():
-                    logger.info(f"Lightning Goats: feeder override enabled, skipping trigger")
+
+                if override_enabled:
+                    logger.info("Lightning Goats: OverrideSwitch is ON, skipping feeder trigger and messages")
                 else:
                     # Trigger feeder
                     if await openhab.trigger_feeder(settings.openhab_feeder_rule_id):
-                        logger.info(f"Lightning Goats: feeder triggered successfully")
+                        logger.info("Lightning Goats: feeder triggered successfully")
                         
                         # Send messaging notification with user_id for template selection
                         msg_success = await send_feeder_message(
@@ -433,29 +444,37 @@ async def _handle_payment(payment: Any) -> None:
                                 get_settings as get_ch_settings,
                             )
 
-                            logger.info(f"Lightning Goats: fetching CyberHerd settings for payment distribution")
+                            logger.info("Lightning Goats: fetching CyberHerd settings for payment distribution")
                             ch_settings = await get_ch_settings(wallet.user)
                             
                             if ch_settings:
-                                logger.info(f"Lightning Goats: triggering CyberHerd payment distribution")
+                                logger.info("Lightning Goats: triggering CyberHerd payment distribution")
                                 result = await transfer_herd_balance_to_source(ch_settings)
                                 if result.get("ok"):
                                     logger.info(f"Lightning Goats: CyberHerd distribution complete: {result.get('sats')} sats")
                                 else:
-                                    logger.error(f"Lightning Goats: CyberHerd distribution failed: {result.get('error')}")
+                                    raise RuntimeError(
+                                        f"CyberHerd distribution failed: {result.get('error')}"
+                                    )
                             else:
-                                logger.error(f"Lightning Goats: CyberHerd settings not found for user {wallet.user}")
+                                raise RuntimeError(
+                                    f"CyberHerd settings not found for user {wallet.user}"
+                                )
 
                         except ImportError:
-                            logger.warning("Lightning Goats: CyberHerd extension not available for payment distribution")
+                            raise RuntimeError(
+                                "CyberHerd extension not available for payment distribution"
+                            )
                         except Exception as e:
-                            logger.error(f"Lightning Goats: Failed to trigger CyberHerd payment: {e}")
+                            raise RuntimeError(f"Failed to trigger CyberHerd payment: {e}") from e
                     else:
-                        logger.error(f"Lightning Goats: feeder trigger failed")
+                        raise RuntimeError("Feeder trigger failed")
                         
             elif amount_sats >= settings.minimum_sats:
-                # Send payment received message (if enabled)
-                if settings.interface_messages_enabled:
+                # Send payment received message (if enabled and override is off)
+                if override_enabled:
+                    logger.info("Lightning Goats: OverrideSwitch is ON, skipping payment received message")
+                elif settings.interface_messages_enabled:
                     logger.info(f"Lightning Goats: sending payment received message for {amount_sats} sats")
                     msg_success = await send_payment_received_message(
                         amount=amount_sats,
@@ -465,15 +484,17 @@ async def _handle_payment(payment: Any) -> None:
                     )
                     logger.info(f"Lightning Goats: payment received message sent: {msg_success}")
                 else:
-                    logger.debug(f"Lightning Goats: interface messages disabled")
+                    logger.debug("Lightning Goats: interface messages disabled")
             else:
                 logger.debug(f"Lightning Goats: payment too small ({amount_sats} sats)")
+
+            processing_succeeded = True
                 
         finally:
             try:
                 await openhab.close()
             finally:
-                if claimed_payment_hash and not payment_failed:
+                if claimed_payment_hash and not payment_failed and processing_succeeded:
                     await mark_payment_processed(claimed_payment_hash)
             
     except Exception as e:
@@ -543,6 +564,16 @@ async def periodic_informational_messages():
                 user_id = settings.user_id
 
                 try:
+                    # Check OverrideSwitch — skip all messages when ON
+                    if settings.openhab_url and settings.openhab_auth:
+                        openhab = OpenHABService(settings.openhab_url, settings.openhab_auth)
+                        try:
+                            if await openhab.is_feeder_override_enabled():
+                                logger.debug(f"Lightning Goats: OverrideSwitch is ON for user {user_id}, skipping periodic messages")
+                                continue
+                        finally:
+                            await openhab.close()
+
                     # Interface info check first to preserve the documented 30% chance.
                     if settings.interface_messages_enabled:
                         if random.random() < DEFAULT_WEATHER_BROADCAST_PROBABILITY:
@@ -564,6 +595,16 @@ async def periodic_informational_messages():
                                     f"Lightning Goats: skipping weather broadcast for user {user_id} - no URL configured"
                                 )
                             else:
+                                try:
+                                    weather_url = ensure_outbound_url_allowed(
+                                        weather_url,
+                                        "weather station URL",
+                                    )
+                                except OutboundURLPolicyError as exc:
+                                    logger.warning(
+                                        f"Lightning Goats: skipping blocked weather URL for user {user_id}: {exc}"
+                                    )
+                                    continue
                                 weather = await fetch_weather_data(weather_url)
                                 if weather:
                                     await send_weather_message(weather, user_id=user_id)
@@ -595,8 +636,6 @@ def start_background_tasks():
     Uses LNbits standard task creation patterns.
     Note: Bitcoin price history is handled by OpenHAB.
     """
-    global _background_tasks
-    
     try:
         # Start periodic messages task using asyncio
         task = asyncio.create_task(periodic_informational_messages())
@@ -609,8 +648,6 @@ def start_background_tasks():
 
 async def stop_background_tasks():
     """Stop all background tasks."""
-    global _background_tasks
-    
     logger.info("Stopping Lightning Goats background tasks")
     
     for task in _background_tasks:

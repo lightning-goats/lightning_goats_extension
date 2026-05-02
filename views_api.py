@@ -1,7 +1,7 @@
 """API routes for Lightning Goats extension."""
 
 import inspect
-from typing import Optional, Any, cast
+from typing import Any, cast
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 
@@ -19,9 +19,29 @@ from .models import (
 )
 from .services.bitcoin_price import get_bitcoin_price_data
 from .services.openhab import OpenHABService
+from .services.url_validation import OutboundURLPolicyError, ensure_outbound_url_allowed
 
 
 lightning_goats_api_router = APIRouter()
+
+
+def is_operationally_configured(settings: LightningGoatsSettings | None) -> bool:
+    """Return true when settings are complete enough to call OpenHAB."""
+
+    return bool(settings and settings.openhab_url and settings.openhab_url.strip())
+
+
+async def ensure_user_wallet(user_id: str, wallet_id: str | None):
+    """Return wallet_id's wallet only if it belongs to user_id."""
+
+    if not wallet_id:
+        return None
+    wallet_obj = await get_wallet(wallet_id)
+    if not wallet_obj:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    if wallet_obj.user != user_id:
+        raise HTTPException(status_code=400, detail="Herd wallet does not belong to this user")
+    return wallet_obj
 
 
 async def check_extension_enabled(wallet: WalletTypeInfo = Depends(require_admin_key)) -> WalletTypeInfo:
@@ -92,7 +112,7 @@ async def get_user_wallets_route(
     """Get all wallets for current user."""
     try:
         wallets = await get_wallets(wallet.wallet.user)
-        return [{"id": w.id, "name": w.name} for w in wallets]
+        return [{"id": w.id, "name": w.name, "inkey": w.inkey} for w in wallets]
     except Exception as e:
         logger.error(f"Failed to get user wallets: {e}")
         raise HTTPException(status_code=500, detail="Failed to get user wallets")
@@ -147,7 +167,8 @@ async def update_settings_route(
     else:
         payload_dict = cast(dict[str, Any], payload.dict())
     
-    logger.debug(f"Lightning Goats: Payload dict: {payload_dict}")
+    redacted_payload = {**payload_dict, "openhab_auth": "***" if payload_dict.get("openhab_auth") else ""}
+    logger.debug(f"Lightning Goats: Payload dict: {redacted_payload}")
     
     settings = LightningGoatsSettings(user_id=wallet.wallet.user, **payload_dict)
     
@@ -155,18 +176,27 @@ async def update_settings_route(
     
     # Validate OpenHAB URL only if provided
     if settings.openhab_url:
-        from urllib.parse import urlparse
-        parsed = urlparse(settings.openhab_url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            logger.warning(f"Lightning Goats: Invalid OpenHAB URL format")
-            raise HTTPException(status_code=400, detail="Invalid OpenHAB URL - must be a valid http:// or https:// URL")
+        try:
+            settings.openhab_url = ensure_outbound_url_allowed(settings.openhab_url, "OpenHAB URL")
+        except OutboundURLPolicyError as exc:
+            logger.warning("Lightning Goats: invalid OpenHAB URL")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Validate weather station URL if provided
     if settings.weather_station_url:
-        from urllib.parse import urlparse as _urlparse
-        parsed_ws = _urlparse(settings.weather_station_url)
-        if parsed_ws.scheme not in ("http", "https") or not parsed_ws.hostname:
-            raise HTTPException(status_code=400, detail="Invalid weather station URL - must be a valid http:// or https:// URL")
+        try:
+            settings.weather_station_url = ensure_outbound_url_allowed(
+                settings.weather_station_url, "weather station URL"
+            )
+        except OutboundURLPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await ensure_user_wallet(wallet.wallet.user, settings.herd_wallet_id)
+
+    # Validate minimum sats
+    if settings.minimum_sats < 1 or settings.minimum_sats > 100_000_000:
+        logger.warning(f"Lightning Goats: Invalid minimum sats: {settings.minimum_sats}")
+        raise HTTPException(status_code=400, detail="Minimum sats must be between 1 and 100,000,000")
 
     # Validate feeder trigger amount
     if settings.feeder_trigger_sats < 1 or settings.feeder_trigger_sats > 100_000_000:
@@ -211,9 +241,11 @@ async def get_balance_route(
         settings = await get_settings(wallet.wallet.user)
         
         # Use herd wallet if configured, otherwise fall back to admin wallet
-        wallet_id = settings.herd_wallet_id if settings and settings.herd_wallet_id else wallet.wallet.id
-        
-        wallet_obj = await get_wallet(wallet_id)
+        wallet_obj = (
+            await ensure_user_wallet(wallet.wallet.user, settings.herd_wallet_id)
+            if settings and settings.herd_wallet_id
+            else await get_wallet(wallet.wallet.id)
+        )
         if not wallet_obj:
             raise HTTPException(status_code=404, detail="Wallet not found")
         return {"balance": wallet_obj.balance_msat, "balance_sats": wallet_obj.balance_msat // 1000}
@@ -265,7 +297,7 @@ async def get_bitcoin_data_route(
     Get Bitcoin price and 24h change from OpenHAB.
     """
     settings = await get_settings(wallet.wallet.user)
-    if not settings:
+    if not is_operationally_configured(settings):
         raise HTTPException(status_code=404, detail="Settings not configured")
     
     openhab = OpenHABService(settings.openhab_url, settings.openhab_auth)
@@ -290,7 +322,7 @@ async def trigger_feeder_manual(
     Optionally bypass the override check.
     """
     settings = await get_settings(wallet.wallet.user)
-    if not settings:
+    if not is_operationally_configured(settings):
         raise HTTPException(status_code=404, detail="Settings not configured")
     
     openhab = OpenHABService(settings.openhab_url, settings.openhab_auth)
@@ -375,7 +407,7 @@ async def get_status_route(
         # Get balance from herd wallet if configured, otherwise from admin wallet
         balance_sats = 0
         if settings and settings.herd_wallet_id:
-            herd_wallet = await get_wallet(settings.herd_wallet_id)
+            herd_wallet = await ensure_user_wallet(wallet.wallet.user, settings.herd_wallet_id)
             balance_sats = herd_wallet.balance_msat // 1000 if herd_wallet else 0
         else:
             wallet_obj = await get_wallet(wallet.wallet.id)
@@ -396,28 +428,34 @@ async def get_status_route(
         except Exception as e:
             logger.debug(f"Could not get active member count from CyberHerd: {e}")
         
-        # Get Bitcoin price
+        # Get Bitcoin price and override status from OpenHAB
         btc_price = None
         btc_change = None
-        if settings:
+        override_enabled = False
+        if is_operationally_configured(settings):
             openhab = OpenHABService(settings.openhab_url, settings.openhab_auth)
             try:
                 price_data = await get_bitcoin_price_data(openhab)
                 btc_price = price_data.btc_usd_price
                 btc_change = price_data.btc_price_24h_percent_change
+                try:
+                    override_enabled = await openhab.is_feeder_override_enabled()
+                except Exception as e:
+                    logger.debug(f"Could not check override status: {e}")
             except Exception as e:
                 logger.debug(f"Could not get Bitcoin price: {e}")
             finally:
                 await openhab.close()
-        
+
         return {
-            "configured": settings is not None,
+            "configured": is_operationally_configured(settings),
             "balance_sats": balance_sats,
             "trigger_amount": trigger_amount,
             "progress_percent": min(100, int((balance_sats / trigger_amount) * 100)) if trigger_amount > 0 else 0,
             "active_members": active_count,
             "btc_price_usd": btc_price,
             "btc_24h_change": btc_change,
+            "override_enabled": override_enabled,
         }
         
     except HTTPException:
