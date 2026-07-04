@@ -45,6 +45,58 @@ from .config import (
 
 # Payment listener name for LNbits
 INVOICE_LISTENER_NAME = "ext_lightning_goats"
+# Unique task names registered with the LNbits task registry.
+INVOICE_LISTENER_TASK_NAME = "ext_lightning_goats_invoice_listener"
+PERIODIC_MESSAGES_TASK_NAME = "ext_lightning_goats_periodic_messages"
+
+# Tasks we own, so we can cancel every one of them when the extension stops.
+scheduled_tasks: list[asyncio.Task] = []
+
+# Per-herd-wallet locks serialize payment processing so two payments crossing
+# the feeder threshold at the same time cannot double-trigger the feeder or
+# double-distribute the herd balance.
+_herd_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_herd_lock(key: str) -> asyncio.Lock:
+    lock = _herd_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _herd_locks[key] = lock
+    return lock
+
+
+async def _alert_processing_failure(payment: Any, idempotency_key: str, error: str) -> None:
+    """Best-effort operator alert when a claimed payment fails to process.
+
+    Sats may have arrived without the feeder firing or the herd being paid, so
+    make the failure visible on the herd websocket channel and via a stable
+    ERROR log marker instead of only recording it in the database.
+    """
+    logger.error(
+        f"Lightning Goats: PAYMENT_PROCESSING_FAILED idempotency_key={idempotency_key} "
+        f"wallet={getattr(payment, 'wallet_id', '?')}: {error}"
+    )
+    try:
+        wallet = await get_wallet(getattr(payment, "wallet_id", None))
+        if not wallet:
+            return
+        from .services.messaging import (
+            _broadcast_websocket_message,
+            _resolve_websocket_topic,
+        )
+
+        topic = await _resolve_websocket_topic(wallet.user)
+        await _broadcast_websocket_message(
+            topic,
+            {
+                "type": "processing_error",
+                "message": "A herd payment could not be fully processed. Check server logs.",
+                "idempotency_key": idempotency_key,
+            },
+        )
+    except Exception as exc:
+        logger.debug(f"Lightning Goats: failed to broadcast processing-failure alert: {exc}")
 
 
 def _coerce_hex(value: Any) -> Optional[str]:
@@ -260,6 +312,8 @@ async def _handle_payment(payment: Any) -> None:
     """
     claimed_payment_hash: Optional[str] = None
     payment_failed: bool = False
+    herd_lock: Optional[asyncio.Lock] = None
+    lock_acquired: bool = False
     try:
         logger.info("Lightning Goats: payment event received")
         logger.info(
@@ -402,6 +456,18 @@ async def _handle_payment(payment: Any) -> None:
                 logger.error("Lightning Goats: invalid payment proof; refusing to process this payment")
                 return
 
+        # Serialize processing per herd wallet so two payments crossing the
+        # threshold together cannot double-trigger the feeder or double-distribute.
+        herd_lock = _get_herd_lock(settings.herd_wallet_id or wallet.id)
+        await herd_lock.acquire()
+        lock_acquired = True
+
+        # Re-read the wallet under the lock so the threshold decision uses a
+        # balance that cannot shift underneath a concurrent payment.
+        fresh_wallet = await get_wallet(wallet.id)
+        if fresh_wallet:
+            wallet = fresh_wallet
+
         # Get current wallet balance
         balance_sats = wallet.balance_msat // 1000
         logger.info(f"Lightning Goats: handling payment of {amount_sats} sats for user {wallet.user[:8]}. Current balance: {balance_sats} sats.")
@@ -503,7 +569,12 @@ async def _handle_payment(payment: Any) -> None:
                 await mark_payment_failed(claimed_payment_hash, f"Unhandled exception: {e}")
             except Exception:
                 pass
+            # Surface money-moving failures to operators instead of failing silently.
+            await _alert_processing_failure(payment, claimed_payment_hash, str(e))
         logger.error(f"Lightning Goats: Error handling payment: {e}", exc_info=True)
+    finally:
+        if herd_lock is not None and lock_acquired:
+            herd_lock.release()
 
 
 def start_payment_listener():
@@ -526,9 +597,10 @@ def start_payment_listener():
 
         async def _handler(payment: Any) -> None:
             await _handle_payment(payment)
-        
+
         listener = wait_for_paid_invoices(INVOICE_LISTENER_NAME, _handler)
-        create_permanent_unique_task("ext_lightning_goats_invoice_listener", listener)
+        task = create_permanent_unique_task(INVOICE_LISTENER_TASK_NAME, listener)
+        scheduled_tasks.append(task)
         logger.info(f"Lightning Goats: Payment listener registered as '{INVOICE_LISTENER_NAME}'")
         return listener
     except Exception as e:
@@ -625,38 +697,53 @@ async def periodic_informational_messages():
             await asyncio.sleep(10)
 
 
-# Task references for cleanup
-_background_tasks = []
-
-
 def start_background_tasks():
     """
     Start all background tasks for Lightning Goats.
-    
-    Uses LNbits standard task creation patterns.
+
+    Uses the LNbits permanent-unique-task registry so the loop auto-restarts on
+    unexpected errors and is tracked for cancellation on extension stop.
     Note: Bitcoin price history is handled by OpenHAB.
     """
     try:
-        # Start periodic messages task using asyncio
-        task = asyncio.create_task(periodic_informational_messages())
-        _background_tasks.append(task)
+        task = create_permanent_unique_task(
+            PERIODIC_MESSAGES_TASK_NAME, periodic_informational_messages
+        )
+        scheduled_tasks.append(task)
         logger.info("Lightning Goats: Periodic informational messages task started")
-        
+
     except Exception as e:
         logger.error(f"Lightning Goats: Failed to start background tasks: {e}", exc_info=True)
 
 
 async def stop_background_tasks():
-    """Stop all background tasks."""
+    """Stop every task the extension started and unregister the payment listener.
+
+    This must cancel the invoice-listener task and remove it from the core
+    invoice-listener registry; otherwise a disabled extension keeps receiving
+    paid-invoice events and would continue triggering the feeder and moving
+    funds (mirrors cyberherd_stop()).
+    """
     logger.info("Stopping Lightning Goats background tasks")
-    
-    for task in _background_tasks:
+
+    # Stop routing paid invoices to us before cancelling the listener task.
+    try:
+        from lnbits.tasks import invoice_listeners
+
+        invoice_listeners.pop(INVOICE_LISTENER_NAME, None)
+        logger.info("Lightning Goats: invoice listener unregistered")
+    except Exception as ex:
+        logger.warning(f"Lightning Goats: failed to unregister invoice listener: {ex}")
+
+    for task in scheduled_tasks:
         if not task.done():
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-    
-    _background_tasks.clear()
+            except Exception as ex:
+                logger.warning(f"Lightning Goats: error cancelling task: {ex}")
+
+    scheduled_tasks.clear()
     logger.info("Lightning Goats background tasks stopped")

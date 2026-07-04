@@ -38,6 +38,69 @@ def test_outbound_url_policy_rejects_unsafe_urls(url):
         validate_outbound_url(url)
 
 
+def test_outbound_url_policy_rejects_hostname_resolving_to_private(monkeypatch):
+    import socket as _socket
+
+    from lnbits.extensions.lightning_goats.services import url_validation
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        # A public-looking name that an attacker points at loopback (SSRF via DNS).
+        return [(_socket.AF_INET, None, None, "", ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(url_validation.socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(OutboundURLPolicyError):
+        url_validation.validate_outbound_url("http://sneaky.example.com/rest")
+
+
+def test_outbound_url_policy_allows_hostname_resolving_to_public(monkeypatch):
+    import socket as _socket
+
+    from lnbits.extensions.lightning_goats.services import url_validation
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        return [(_socket.AF_INET, None, None, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(url_validation.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert (
+        url_validation.validate_outbound_url("http://public.example.com/rest")
+        == "http://public.example.com/rest"
+    )
+
+
+def test_stop_unregisters_invoice_listener_and_cancels_tasks():
+    from lnbits.tasks import invoice_listeners
+
+    invoice_listeners[tasks.INVOICE_LISTENER_NAME] = object()
+
+    class FakeTask:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+        def __await__(self):
+            async def _raise():
+                raise asyncio.CancelledError
+
+            return _raise().__await__()
+
+    fake = FakeTask()
+    tasks.scheduled_tasks.clear()
+    tasks.scheduled_tasks.append(fake)
+
+    run(tasks.stop_background_tasks())
+
+    assert tasks.INVOICE_LISTENER_NAME not in invoice_listeners
+    assert fake.cancelled
+    assert tasks.scheduled_tasks == []
+
+
 def test_operational_configuration_requires_openhab_url():
     assert not views_api.is_operationally_configured(SimpleNamespace(openhab_url=""))
     assert views_api.is_operationally_configured(SimpleNamespace(openhab_url="http://10.8.0.2:8080"))

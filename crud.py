@@ -34,31 +34,43 @@ async def try_claim_payment(
 
     We persist the payment proof (preimage) so we can (a) audit, and (b)
     verify authenticity when available.
+
+    Uses INSERT ... ON CONFLICT DO NOTHING and inspects the affected row count
+    so the claim decision does not depend on parsing driver-specific error text.
     """
     table = _processed_payments_table(db)
+    params = {
+        "payment_hash": payment_hash,
+        "checking_id": checking_id,
+        "wallet_id": wallet_id,
+        "amount_msat": amount_msat,
+        "preimage": preimage,
+    }
     try:
-        await db.execute(
+        result = await db.execute(
             f"""
             INSERT INTO {table}
                 (payment_hash, checking_id, wallet_id, amount_msat, preimage, status)
             VALUES
                 (:payment_hash, :checking_id, :wallet_id, :amount_msat, :preimage, 'processing')
+            ON CONFLICT (payment_hash) DO NOTHING
             """,
-            {
-                "payment_hash": payment_hash,
-                "checking_id": checking_id,
-                "wallet_id": wallet_id,
-                "amount_msat": amount_msat,
-                "preimage": preimage,
-            },
+            params,
         )
-        return True
     except Exception as e:
-        # SQLite: "UNIQUE constraint failed", Postgres: "duplicate key value"
+        # A checking_id unique-index collision (a second event for the same
+        # already-recorded payment) also means "already processed".
         msg = str(e).lower()
         if "unique" in msg or "duplicate" in msg or "constraint" in msg or "already exists" in msg:
             return False
         raise
+
+    rowcount = getattr(result, "rowcount", None)
+    if rowcount is None:
+        # Driver did not report an affected count; fall back to an existence
+        # check so we still behave idempotently.
+        return not await was_payment_processed(payment_hash)
+    return rowcount > 0
 
 
 async def mark_payment_processed(payment_hash: str) -> None:
