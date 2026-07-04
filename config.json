@@ -4,7 +4,13 @@
   "short_description": "IoT integration for automated goat feeding",
   "tile": "/lightning_goats/static/tile.png",
   "min_lnbits_version": "1.3.0",
-  "contributors": [],
+  "contributors": [
+    {
+      "name": "Sat",
+      "uri": "https://github.com/santyr",
+      "role": "Author"
+    }
+  ],
   "images": [],
   "license": "MIT",
   "nostr_signing": [
@@ -13,7 +19,10 @@
       "kind_label": "Short Text Note",
       "description": "Signs and publishes Lightning Goats interface updates and weather status notes.",
       "required": false,
-      "recommended_rate_limit": {"count": 200, "seconds": 86400}
+      "recommended_rate_limit": {
+        "count": 200,
+        "seconds": 86400
+      }
     }
   ]
 }
