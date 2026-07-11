@@ -11,15 +11,26 @@ INTERFACE_INFO_FALLBACK_MESSAGE = "Lightning Goats interface update available."
 
 
 async def _resolve_herd_wallet_id(user_id: Optional[str]) -> Optional[str]:
-    """Return the herd_wallet from cyberherd settings for the user, or None."""
+    """Return the herd_wallet from cyberherd settings for the user, or None.
+
+    A None result means Nostr signing (which needs this wallet id) will be
+    skipped by publish_event_message; the websocket broadcast still goes out.
+    """
     if not user_id:
         return None
+    herd_wallet_id = None
     try:
         from lnbits.extensions.cyberherd.crud import get_settings as get_ch_settings
         settings = await get_ch_settings(user_id)
-        return getattr(settings, "herd_wallet", None) if settings else None
+        herd_wallet_id = getattr(settings, "herd_wallet", None) if settings else None
     except Exception:
-        return None
+        herd_wallet_id = None
+    if not herd_wallet_id:
+        logger.debug(
+            f"Lightning Goats: no herd wallet resolved for user {user_id}; "
+            f"Nostr publishing will be skipped (websocket still delivered)"
+        )
+    return herd_wallet_id
 
 
 async def _broadcast_websocket_message(topic: str, payload: Dict[str, Any]) -> bool:
@@ -159,9 +170,9 @@ async def send_feeder_message(
         )
 
         if success:
-            logger.info(f"Lightning Goats: Successfully published feeder trigger message")
+            logger.info("Lightning Goats: Successfully published feeder trigger message")
         else:
-            logger.warning(f"Lightning Goats: Failed to publish feeder trigger message")
+            logger.warning("Lightning Goats: Failed to publish feeder trigger message")
         
         return success
         
@@ -266,9 +277,9 @@ async def send_payment_received_message(
         )
         
         if success:
-            logger.info(f"Lightning Goats: Successfully published payment received message")
+            logger.info("Lightning Goats: Successfully published payment received message")
         else:
-            logger.warning(f"Lightning Goats: Failed to publish payment received message")
+            logger.warning("Lightning Goats: Failed to publish payment received message")
         
         return success
         

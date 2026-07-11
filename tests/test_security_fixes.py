@@ -16,6 +16,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _reset_feeder_cooldown():
+    tasks._last_feed_monotonic.clear()
+    yield
+    tasks._last_feed_monotonic.clear()
+
+
 def test_outbound_url_policy_allows_public_and_wireguard_urls():
     assert validate_outbound_url("https://example.com/api") == "https://example.com/api"
     assert validate_outbound_url("http://10.8.0.42:8080/rest") == "http://10.8.0.42:8080/rest"
@@ -141,7 +148,7 @@ def test_failed_feeder_trigger_marks_payment_failed_not_processed(monkeypatch):
     async def fake_get_wallet(wallet_id):
         return SimpleNamespace(id=wallet_id, user="user-a", balance_msat=2_000_000)
 
-    async def fake_get_settings(user_id):
+    async def fake_get_settings(user_id, auto_populate=True):
         return SimpleNamespace(
             openhab_url="http://10.8.0.2:8080",
             openhab_auth="token",
@@ -208,7 +215,7 @@ def test_unconfigured_payment_is_not_claimed(monkeypatch):
     async def fake_get_wallet(wallet_id):
         return SimpleNamespace(id=wallet_id, user="user-a", balance_msat=2_000_000)
 
-    async def fake_get_settings(user_id):
+    async def fake_get_settings(user_id, auto_populate=True):
         return SimpleNamespace(openhab_url="", herd_wallet_id="wallet-a")
 
     async def fake_try_claim_payment(**kwargs):
@@ -231,3 +238,190 @@ def test_unconfigured_payment_is_not_claimed(monkeypatch):
     run(tasks._handle_payment(payment))
 
     assert not claimed
+
+
+# ---------------------------------------------------------------------------
+# Distribution overlap with cyberherd: check whether cyberherd is distributing
+# (send_splits_enabled) and act accordingly.
+# ---------------------------------------------------------------------------
+
+
+def _lg_settings(**overrides):
+    base = dict(
+        openhab_url="http://10.8.0.2:8080",
+        openhab_auth="token",
+        openhab_feeder_rule_id="rule-1",
+        herd_wallet_id="wallet-a",
+        feeder_trigger_sats=1_000,
+        minimum_sats=10,
+        interface_messages_enabled=True,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class _FakeOpenHABTriggers:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def is_feeder_override_enabled(self):
+        return False
+
+    async def trigger_feeder(self, rule_id):
+        return True
+
+    async def close(self):
+        pass
+
+
+def _patch_feeder_path(monkeypatch, state):
+    async def fake_get_wallet(wallet_id):
+        return SimpleNamespace(id=wallet_id, user="user-a", balance_msat=2_000_000)
+
+    async def fake_get_settings(user_id, auto_populate=True):
+        return _lg_settings()
+
+    async def fake_claim(**kwargs):
+        return True
+
+    async def fake_processed(payment_hash):
+        state["processed"].append(payment_hash)
+
+    async def fake_failed(payment_hash, error):
+        state["failed"].append((payment_hash, error))
+
+    async def fake_send_feeder_message(**kwargs):
+        return True
+
+    monkeypatch.setattr(tasks, "get_wallet", fake_get_wallet)
+    monkeypatch.setattr(tasks, "get_settings", fake_get_settings)
+    monkeypatch.setattr(tasks, "try_claim_payment", fake_claim)
+    monkeypatch.setattr(tasks, "mark_payment_processed", fake_processed)
+    monkeypatch.setattr(tasks, "mark_payment_failed", fake_failed)
+    monkeypatch.setattr(tasks, "send_feeder_message", fake_send_feeder_message)
+    monkeypatch.setattr(tasks, "OpenHABService", _FakeOpenHABTriggers)
+    monkeypatch.setattr(tasks, "_LG_STARTED_AT", None)
+    monkeypatch.setattr(tasks, "_LG_TODAY_START", None)
+
+
+def _payment(checking_id):
+    return SimpleNamespace(
+        wallet_id="wallet-a", amount=2_000_000, checking_id=checking_id,
+        payment_hash=None, preimage=None, extra={},
+    )
+
+
+def test_delegates_distribution_when_cyberherd_autosplits_enabled(monkeypatch):
+    state = {"processed": [], "failed": []}
+    transfer_calls = []
+    _patch_feeder_path(monkeypatch, state)
+
+    async def ch_get_settings(user_id):
+        return SimpleNamespace(send_splits_enabled=True, herd_wallet="wallet-a")
+
+    async def ch_transfer(settings):
+        transfer_calls.append(settings)
+        return {"ok": True, "sats": 0}
+
+    monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd.services.send_splits.transfer_herd_balance_to_source",
+        ch_transfer,
+    )
+
+    run(tasks._handle_payment(_payment("c1")))
+
+    # Delegated to cyberherd: LG must NOT distribute, and the feed is a success.
+    assert transfer_calls == []
+    assert state["processed"] == ["c1"]
+    assert not state["failed"]
+
+
+def test_zero_balance_distribution_is_not_a_failure(monkeypatch):
+    state = {"processed": [], "failed": []}
+    _patch_feeder_path(monkeypatch, state)
+
+    async def ch_get_settings(user_id):
+        return SimpleNamespace(send_splits_enabled=False, herd_wallet="wallet-a")
+
+    async def ch_transfer(settings):
+        return {"ok": False, "error": "Herd wallet balance is zero"}
+
+    monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd.services.send_splits.transfer_herd_balance_to_source",
+        ch_transfer,
+    )
+
+    run(tasks._handle_payment(_payment("c2")))
+
+    # An already-empty herd wallet is "already distributed", not a failure.
+    assert state["processed"] == ["c2"]
+    assert not state["failed"]
+
+
+def test_no_herd_wallet_configured_skips_payment(monkeypatch):
+    """Fail closed: with no herd wallet configured, do not process (feeder must
+    not fire on an unrelated wallet)."""
+    triggered = []
+
+    async def fake_get_wallet(wallet_id):
+        return SimpleNamespace(id=wallet_id, user="user-a", balance_msat=2_000_000)
+
+    async def fake_get_settings(user_id, auto_populate=True):
+        return _lg_settings(herd_wallet_id=None)
+
+    async def fake_claim(**kwargs):
+        triggered.append("claimed")
+        return True
+
+    monkeypatch.setattr(tasks, "get_wallet", fake_get_wallet)
+    monkeypatch.setattr(tasks, "get_settings", fake_get_settings)
+    monkeypatch.setattr(tasks, "try_claim_payment", fake_claim)
+
+    run(tasks._handle_payment(_payment("c3")))
+
+    # Returned before claiming/processing anything.
+    assert triggered == []
+
+
+def test_feeder_does_not_refire_within_cooldown(monkeypatch):
+    """Feeder cooldown: a second payment arriving right after a feed (within the
+    cooldown window) must not feed the goats again, even though its balance is
+    still above the trigger."""
+    state = {"processed": [], "failed": []}
+    feeds = []
+    _patch_feeder_path(monkeypatch, state)
+
+    class CountingOpenHAB(_FakeOpenHABTriggers):
+        async def trigger_feeder(self, rule_id):
+            feeds.append(rule_id)
+            return True
+
+    monkeypatch.setattr(tasks, "OpenHABService", CountingOpenHAB)
+
+    async def ch_get_settings(user_id):
+        # auto-splits on -> LG delegates; the fake balance never drops.
+        return SimpleNamespace(send_splits_enabled=True, herd_wallet="wallet-a")
+
+    monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
+
+    run(tasks._handle_payment(_payment("p1")))
+    run(tasks._handle_payment(_payment("p2")))
+
+    assert feeds == ["rule-1"]                    # fed exactly once
+    assert state["processed"] == ["p1", "p2"]     # both handled successfully
+    assert not state["failed"]
+
+
+def test_extra_string_is_not_used_as_preimage(monkeypatch):
+    """A bare hex-like string in payment.extra must not be treated as a preimage
+    (it would fail proof verification and wrongly reject the payment)."""
+    payment = SimpleNamespace(
+        wallet_id="w", amount=1000, checking_id="chk", payment_hash=None,
+        preimage=None, extra="deadbeef" * 8,  # 64 hex chars, but NOT a preimage
+    )
+    ph, chk, preimage = tasks._extract_payment_hash_checking_id_preimage(payment)
+    assert preimage is None
+    assert ph is None
+    assert chk == "chk"

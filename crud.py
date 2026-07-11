@@ -91,6 +91,58 @@ async def mark_payment_failed(payment_hash: str, error: str) -> None:
     )
 
 
+async def reconcile_stale_processing_payments(max_age_seconds: int = 900) -> int:
+    """Mark payments stuck in 'processing' beyond max_age_seconds as 'failed'.
+
+    A row stays 'processing' if the handler was interrupted (crash/restart)
+    between claiming the payment and writing its terminal status. Left alone it
+    is neither retried (the claim would return False) nor visible. We do not
+    reprocess it — that could re-fire the physical feeder — but we mark it
+    'failed' so it is terminal and shows up as an error. Returns the count marked.
+    """
+    from datetime import datetime, timezone
+
+    table = _processed_payments_table(db)
+    try:
+        rows = await db.fetchall(
+            f"SELECT payment_hash, created_at FROM {table} WHERE status = 'processing'"
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "no such table" in msg or "does not exist" in msg or "undefinedtable" in msg:
+            return 0
+        raise
+
+    now = datetime.now(timezone.utc)
+    stale: list[str] = []
+    for row in rows or []:
+        created_at = row.get("created_at") if isinstance(row, dict) else row["created_at"]
+        created_dt: Optional[datetime] = None
+        if isinstance(created_at, datetime):
+            created_dt = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        elif isinstance(created_at, str) and created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                created_dt = None
+        # If we cannot determine the age, err on the side of reconciling it.
+        if created_dt is None or (now - created_dt).total_seconds() >= max_age_seconds:
+            ph = row.get("payment_hash") if isinstance(row, dict) else row["payment_hash"]
+            if ph:
+                stale.append(ph)
+
+    for ph in stale:
+        await mark_payment_failed(ph, "Stale 'processing' row reconciled (handler interrupted)")
+
+    if stale:
+        logger.warning(
+            f"Lightning Goats: reconciled {len(stale)} stale 'processing' payment(s) to 'failed'"
+        )
+    return len(stale)
+
+
 async def was_payment_processed(payment_hash: str) -> bool:
     """Fast check (non-atomic). Prefer try_claim_payment for race-free behavior."""
     table = _processed_payments_table(db)

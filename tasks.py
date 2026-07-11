@@ -4,6 +4,7 @@ import asyncio
 import random
 import hashlib
 import os
+import time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Any, Optional, Tuple
@@ -27,6 +28,7 @@ from .crud import (
     try_claim_payment,
     mark_payment_processed,
     mark_payment_failed,
+    reconcile_stale_processing_payments,
 )
 from .services.openhab import OpenHABService
 from .services.messaging import (
@@ -64,6 +66,73 @@ def _get_herd_lock(key: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _herd_locks[key] = lock
     return lock
+
+
+# Per-herd-wallet feeder cooldown. After a feed, the feeder will not fire again
+# for this many seconds. This prevents the goats being fed repeatedly by
+# successive payments when the balance is not cleared (e.g. a distribution
+# failure leaves it above the trigger) and generally guards against
+# over-feeding. Distribution still runs on cooled-down payments. Set to 0 to
+# disable. Note: per-process (like the herd locks); a multi-worker deployment
+# would need a shared store, but LNbits runs a single invoice listener.
+FEEDER_COOLDOWN_SECONDS = max(
+    0, int(os.getenv("LIGHTNING_GOATS_FEEDER_COOLDOWN_SECONDS", "60"))
+)
+_last_feed_monotonic: dict[str, float] = {}
+
+
+async def _distribute_herd_balance(user_id: str) -> None:
+    """Distribute the herd wallet balance via cyberherd.
+
+    cyberherd runs its own invoice listener that auto-distributes the herd wallet
+    when ``send_splits_enabled`` is True, so we check whether cyberherd is
+    distributing and act accordingly: delegate to it when auto-splits are on, and
+    only distribute ourselves as the fallback when they are off. An already-empty
+    herd wallet ("balance is zero") means something distributed it first and is
+    treated as done, not a failure. Raises RuntimeError on a real failure.
+    """
+    try:
+        from lnbits.extensions.cyberherd.crud import get_settings as get_ch_settings
+
+        ch_settings = await get_ch_settings(user_id)
+        if not ch_settings:
+            raise RuntimeError(f"CyberHerd settings not found for user {user_id}")
+
+        if getattr(ch_settings, "send_splits_enabled", False):
+            logger.info(
+                "Lightning Goats: cyberherd auto-splits are enabled; "
+                "delegating herd distribution to cyberherd"
+            )
+            return
+
+        from lnbits.extensions.cyberherd.services.send_splits import (
+            transfer_herd_balance_to_source,
+        )
+
+        logger.info(
+            "Lightning Goats: cyberherd auto-splits disabled; distributing herd balance directly"
+        )
+        result = await transfer_herd_balance_to_source(ch_settings)
+        if result.get("ok"):
+            logger.info(
+                f"Lightning Goats: CyberHerd distribution complete: {result.get('sats')} sats"
+            )
+            return
+
+        error = str(result.get("error") or "")
+        if "zero" in error.lower():
+            logger.info(
+                "Lightning Goats: herd balance already distributed; nothing to transfer"
+            )
+            return
+        raise RuntimeError(f"CyberHerd distribution failed: {error}")
+
+    except ImportError:
+        raise RuntimeError("CyberHerd extension not available for payment distribution")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Failed to trigger CyberHerd payment: {e}") from e
 
 
 async def _alert_processing_failure(payment: Any, idempotency_key: str, error: str) -> None:
@@ -148,11 +217,14 @@ def _extract_payment_hash_checking_id_preimage(payment: Any) -> Tuple[Optional[s
     )
     preimage = _coerce_hex(preimage)
 
-    # Some LNbits event payloads nest details under `extra`
-    if preimage is None:
-        preimage = _coerce_hex(getattr(payment, "extra", None))
-    if payment_hash is None:
-        payment_hash = _coerce_hex(getattr(payment, "extra", None))
+    # Some LNbits event payloads nest the preimage under `extra`, but only under
+    # known preimage keys. Only mine `extra` when it is a dict — a bare hex-like
+    # string in `extra` is NOT a preimage and must not be treated as one (it
+    # would then fail proof verification and reject a valid payment). `extra`
+    # never carries the payment_hash, so we do not derive it from there.
+    extra = getattr(payment, "extra", None)
+    if preimage is None and isinstance(extra, dict):
+        preimage = _coerce_hex(extra)
 
     return payment_hash, checking_id, preimage
 
@@ -334,8 +406,10 @@ async def _handle_payment(payment: Any) -> None:
             logger.warning(f"Lightning Goats: could not find wallet {payment.wallet_id}")
             return
         
-        # Get settings for this wallet's user
-        settings = await get_settings(wallet.user)
+        # Get settings for this wallet's user. Do not auto-populate here: that
+        # writes to the DB, and the payment handler is a hot path. Settings are
+        # populated when the user saves them in the UI.
+        settings = await get_settings(wallet.user, auto_populate=False)
         if not settings:
             logger.debug(f"Lightning Goats: no settings for user {wallet.user}")
             return
@@ -343,17 +417,25 @@ async def _handle_payment(payment: Any) -> None:
             logger.debug(f"Lightning Goats: OpenHAB URL not configured for user {wallet.user}")
             return
         
-        # Check if this payment is for the configured herd wallet
-        if settings.herd_wallet_id:
-            payment_wallet_normalized = str(payment.wallet_id).strip().lower()
-            herd_wallet_normalized = str(settings.herd_wallet_id).strip().lower()
-            
-            if payment_wallet_normalized != herd_wallet_normalized:
-                logger.info(
-                    f"Lightning Goats: payment to non-herd wallet {payment_wallet_normalized}. "
-                    f"Expected (herd): {herd_wallet_normalized}. Skipping."
-                )
-                return
+        # Check if this payment is for the configured herd wallet. Fail closed:
+        # if no herd wallet is configured we cannot confirm this payment belongs
+        # to the herd, so we must not trigger the feeder on an unrelated wallet.
+        if not settings.herd_wallet_id:
+            logger.debug(
+                f"Lightning Goats: no herd wallet configured for user {wallet.user}; "
+                f"skipping payment to wallet {payment.wallet_id}"
+            )
+            return
+
+        payment_wallet_normalized = str(payment.wallet_id).strip().lower()
+        herd_wallet_normalized = str(settings.herd_wallet_id).strip().lower()
+
+        if payment_wallet_normalized != herd_wallet_normalized:
+            logger.info(
+                f"Lightning Goats: payment to non-herd wallet {payment_wallet_normalized}. "
+                f"Expected (herd): {herd_wallet_normalized}. Skipping."
+            )
+            return
         
         
         # === Exactly-once payment processing (idempotency) ===
@@ -402,8 +484,11 @@ async def _handle_payment(payment: Any) -> None:
                     f"Lightning Goats: ignoring historical payment on startup (idempotency_key={idempotency_key}, payment_dt={payment_dt.isoformat()})"
                 )
                 return
-            # If we can't determine timestamp during startup backlog, be conservative and ignore it once.
-            if payment_dt is None and checking_id is None:
+            # If we can't determine the timestamp during startup backlog, be
+            # conservative and ignore it once — regardless of whether we have a
+            # checking_id. Processing an unknown-age payment could re-fire the
+            # feeder for a historical invoice.
+            if payment_dt is None:
                 preimage_to_store = preimage or 'unavailable'
                 claimed = await try_claim_payment(
                     payment_hash=idempotency_key,
@@ -480,17 +565,35 @@ async def _handle_payment(payment: Any) -> None:
             # Check override state once for use in feeder and messaging decisions
             override_enabled = await openhab.is_feeder_override_enabled()
 
+            cooldown_key = settings.herd_wallet_id or wallet.id
+
             # Check if we should trigger feeder
             if balance_sats >= settings.feeder_trigger_sats:
                 logger.info(f"Lightning Goats: feeder trigger threshold reached ({balance_sats} >= {settings.feeder_trigger_sats})")
 
+                last_feed = _last_feed_monotonic.get(cooldown_key, 0.0)
+                in_cooldown = (
+                    FEEDER_COOLDOWN_SECONDS > 0
+                    and (time.monotonic() - last_feed) < FEEDER_COOLDOWN_SECONDS
+                )
+
                 if override_enabled:
                     logger.info("Lightning Goats: OverrideSwitch is ON, skipping feeder trigger and messages")
+                elif in_cooldown:
+                    # We fed recently and the balance is still above the trigger
+                    # (not cleared — e.g. a prior distribution failed). Do NOT
+                    # feed again yet, but still attempt distribution to clear it.
+                    logger.warning(
+                        f"Lightning Goats: feeder cooldown active "
+                        f"({FEEDER_COOLDOWN_SECONDS}s); skipping feeder, retrying distribution"
+                    )
+                    await _distribute_herd_balance(wallet.user)
                 else:
                     # Trigger feeder
                     if await openhab.trigger_feeder(settings.openhab_feeder_rule_id):
                         logger.info("Lightning Goats: feeder triggered successfully")
-                        
+                        _last_feed_monotonic[cooldown_key] = time.monotonic()
+
                         # Send messaging notification with user_id for template selection
                         msg_success = await send_feeder_message(
                             balance_sats=balance_sats,
@@ -498,44 +601,12 @@ async def _handle_payment(payment: Any) -> None:
                             user_id=wallet.user,
                         )
                         logger.info(f"Lightning Goats: feeder message sent: {msg_success}")
-                        
-                        # Distribute to cyberherd members using internal function
-                        try:
-                            # Use transfer_herd_balance_to_source directly to bypass the
-                            # "send_splits_enabled" check in cyberherd.
-                            from lnbits.extensions.cyberherd.services.send_splits import (
-                                transfer_herd_balance_to_source,
-                            )
-                            from lnbits.extensions.cyberherd.crud import (
-                                get_settings as get_ch_settings,
-                            )
 
-                            logger.info("Lightning Goats: fetching CyberHerd settings for payment distribution")
-                            ch_settings = await get_ch_settings(wallet.user)
-                            
-                            if ch_settings:
-                                logger.info("Lightning Goats: triggering CyberHerd payment distribution")
-                                result = await transfer_herd_balance_to_source(ch_settings)
-                                if result.get("ok"):
-                                    logger.info(f"Lightning Goats: CyberHerd distribution complete: {result.get('sats')} sats")
-                                else:
-                                    raise RuntimeError(
-                                        f"CyberHerd distribution failed: {result.get('error')}"
-                                    )
-                            else:
-                                raise RuntimeError(
-                                    f"CyberHerd settings not found for user {wallet.user}"
-                                )
-
-                        except ImportError:
-                            raise RuntimeError(
-                                "CyberHerd extension not available for payment distribution"
-                            )
-                        except Exception as e:
-                            raise RuntimeError(f"Failed to trigger CyberHerd payment: {e}") from e
+                        # Distribute (or delegate to cyberherd — see helper).
+                        await _distribute_herd_balance(wallet.user)
                     else:
                         raise RuntimeError("Feeder trigger failed")
-                        
+
             elif amount_sats >= settings.minimum_sats:
                 # Send payment received message (if enabled and override is off)
                 if override_enabled:
@@ -555,14 +626,25 @@ async def _handle_payment(payment: Any) -> None:
                 logger.debug(f"Lightning Goats: payment too small ({amount_sats} sats)")
 
             processing_succeeded = True
-                
+
         finally:
+            # Neither closing the OpenHAB client nor recording the terminal status
+            # may escape here: if they did, the outer handler would mark an
+            # already-successful, money-moved payment as failed and alert on it.
             try:
                 await openhab.close()
-            finally:
-                if claimed_payment_hash and not payment_failed and processing_succeeded:
+            except Exception as close_exc:
+                logger.warning(f"Lightning Goats: error closing OpenHAB client: {close_exc}")
+
+            if claimed_payment_hash and not payment_failed and processing_succeeded:
+                try:
                     await mark_payment_processed(claimed_payment_hash)
-            
+                except Exception as mark_exc:
+                    logger.error(
+                        f"Lightning Goats: payment {claimed_payment_hash} succeeded but "
+                        f"could not be marked processed: {mark_exc}"
+                    )
+
     except Exception as e:
         if claimed_payment_hash and not payment_failed:
             try:
@@ -616,12 +698,26 @@ async def periodic_informational_messages():
     This replaces the periodic_informational_messages from main.nozaps.py.
     """
     logger.info("Starting periodic informational messages task")
-    
+
+    # Reconcile any payments left stuck in 'processing' by an interrupted run
+    # (crash/restart between claim and terminal status) once at startup.
+    try:
+        await reconcile_stale_processing_payments()
+    except Exception as exc:
+        logger.warning(f"Lightning Goats: stale-payment reconciliation failed at startup: {exc}")
+
     while True:
         try:
             # Wait for the configured interval
             await asyncio.sleep(DEFAULT_WEATHER_BROADCAST_INTERVAL)
-            
+
+            # Periodically reconcile stale 'processing' rows so an interrupted
+            # payment does not stay silently stuck.
+            try:
+                await reconcile_stale_processing_payments()
+            except Exception as exc:
+                logger.debug(f"Lightning Goats: stale-payment reconciliation failed: {exc}")
+
             try:
                 all_settings = await get_all_settings()
             except Exception as exc:
