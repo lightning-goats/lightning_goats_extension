@@ -5,7 +5,7 @@ import random
 import hashlib
 import os
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Optional, Tuple
 from loguru import logger
@@ -279,6 +279,13 @@ def _parse_ts_to_dt(value: Any) -> Optional[datetime]:
     if value is None:
         return None
     try:
+        # datetime object — LNbits' Payment.time / created_at / updated_at are
+        # tz-aware UTC datetimes. Without this branch a datetime falls through to
+        # `return None`, so every live payment is treated as "unknown timestamp"
+        # and dropped by the startup-backlog guard for 180s after each restart.
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return dt.astimezone(_LG_TZ)
         # numeric epoch
         if isinstance(value, (int, float)):
             v = float(value)

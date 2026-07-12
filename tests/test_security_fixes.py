@@ -425,3 +425,37 @@ def test_extra_string_is_not_used_as_preimage(monkeypatch):
     assert preimage is None
     assert ph is None
     assert chk == "chk"
+
+
+def test_parse_ts_handles_datetime_objects():
+    """LNbits Payment.time / created_at are datetime objects. The parser must
+    accept them; otherwise a datetime falls through to None and every live
+    payment is dropped as an 'unknown timestamp' during the startup-backlog
+    window (the feeder never auto-triggers for ~180s after each restart)."""
+    import datetime as _dt
+
+    aware = _dt.datetime(2026, 7, 12, 13, 0, tzinfo=_dt.timezone.utc)
+    parsed = tasks._parse_ts_to_dt(aware)
+    assert parsed is not None
+    assert parsed.timestamp() == aware.timestamp()
+
+    # naive datetimes are assumed UTC
+    naive = _dt.datetime(2026, 7, 12, 13, 0)
+    assert tasks._parse_ts_to_dt(naive) is not None
+
+    # existing formats still parse
+    assert tasks._parse_ts_to_dt(1783861245) is not None
+    assert tasks._parse_ts_to_dt("2026-07-12T13:00:00Z") is not None
+    assert tasks._parse_ts_to_dt(None) is None
+
+
+def test_extract_payment_dt_reads_payment_time():
+    """A live payment's datetime is extracted, so the startup guard no longer
+    treats it as unknown-timestamp."""
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    payment = SimpleNamespace(time=now, created_at=now, extra={})
+    dt = tasks._extract_payment_dt(payment)
+    assert dt is not None
+    assert dt.timestamp() == pytest.approx(now.timestamp())
