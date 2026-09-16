@@ -52,13 +52,17 @@ def _resolve_host_ips(host: str) -> list:
     return resolved
 
 
-def validate_outbound_url(url: str) -> str:
+def validate_outbound_url(url: str, *, allow_loopback: bool = False) -> str:
     """Validate a user-configured outbound URL and return its stripped value.
 
-    Public HTTP(S) URLs are allowed. The WireGuard subnet 10.8.0.0/24 is the
-    only allowed private range. Hostnames are resolved and every resulting IP
-    is checked, so a public name that resolves to a private/loopback/metadata
-    address (SSRF via DNS) is rejected rather than trusted blindly.
+    Public HTTP(S) URLs and the WireGuard subnet 10.8.0.0/24 are allowed.
+    Loopback is rejected by default. OpenHAB callers may opt in to literal
+    loopback addresses (127.0.0.0/8 or ::1) and the exact hostname
+    ``localhost`` because OpenHAB can legitimately run on the same host.
+
+    Other hostnames are resolved and every resulting IP is checked, so a
+    public-looking name that resolves to a private/loopback/metadata address
+    (SSRF via DNS) is still rejected.
     """
 
     value = (url or "").strip()
@@ -67,16 +71,27 @@ def validate_outbound_url(url: str) -> str:
         raise OutboundURLPolicyError("URL must be a valid http:// or https:// URL")
 
     hostname = parsed.hostname.strip().lower()
-    if hostname == "localhost" or hostname.endswith(".localhost"):
+    if hostname == "localhost":
+        if allow_loopback:
+            return value
+        raise OutboundURLPolicyError("localhost URLs are not allowed")
+    if hostname.endswith(".localhost"):
         raise OutboundURLPolicyError("localhost URLs are not allowed")
 
-    # Collect every IP we must vet: the literal (if the host is an IP) or all
-    # addresses the name resolves to.
-    candidates = []
+    # Literal loopback is allowed only for explicitly opted-in integrations.
     try:
-        candidates.append(ip_address(hostname))
+        literal_ip = ip_address(hostname)
     except ValueError:
-        candidates.extend(_resolve_host_ips(hostname))
+        literal_ip = None
+
+    if literal_ip is not None:
+        if allow_loopback and literal_ip.is_loopback:
+            return value
+        candidates = [literal_ip]
+    else:
+        # Hostnames must still pass the normal SSRF checks. In particular,
+        # allow_loopback does not permit DNS names that resolve to loopback.
+        candidates = _resolve_host_ips(hostname)
 
     # If the host neither is an IP literal nor resolves, it is unreachable; we
     # keep the historically permissive behaviour and let the request attempt
@@ -91,9 +106,15 @@ def validate_outbound_url(url: str) -> str:
 
 
 def ensure_outbound_url_allowed(url: str, field_name: str = "URL") -> str:
-    """Validate a URL and raise ValueError with a field-specific message."""
+    """Validate a URL and raise ValueError with a field-specific message.
+
+    OpenHAB is the sole integration allowed to target the local loopback
+    interface; other integrations keep the stricter outbound URL policy.
+    """
+
+    allow_loopback = field_name.strip().lower() == "openhab url"
 
     try:
-        return validate_outbound_url(url)
+        return validate_outbound_url(url, allow_loopback=allow_loopback)
     except OutboundURLPolicyError as exc:
         raise OutboundURLPolicyError(f"Invalid {field_name}: {exc}") from exc
