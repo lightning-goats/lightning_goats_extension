@@ -56,9 +56,9 @@ def validate_outbound_url(url: str, *, allow_loopback: bool = False) -> str:
     """Validate a user-configured outbound URL and return its stripped value.
 
     Public HTTP(S) URLs and the WireGuard subnet 10.8.0.0/24 are allowed.
-    Loopback is rejected by default. OpenHAB callers may opt in to literal
-    loopback addresses (127.0.0.0/8 or ::1) and the exact hostname
-    ``localhost`` because OpenHAB can legitimately run on the same host.
+    Loopback is rejected by default by the low-level validator. Integration
+    callers may opt in to literal loopback addresses (127.0.0.0/8 or ::1) and
+    the exact hostname ``localhost`` for services running on the same host.
 
     Other hostnames are resolved and every resulting IP is checked, so a
     public-looking name that resolves to a private/loopback/metadata address
@@ -78,7 +78,7 @@ def validate_outbound_url(url: str, *, allow_loopback: bool = False) -> str:
     if hostname.endswith(".localhost"):
         raise OutboundURLPolicyError("localhost URLs are not allowed")
 
-    # Literal loopback is allowed only for explicitly opted-in integrations.
+    # Literal loopback is allowed only when the caller explicitly opts in.
     try:
         literal_ip = ip_address(hostname)
     except ValueError:
@@ -99,22 +99,22 @@ def validate_outbound_url(url: str, *, allow_loopback: bool = False) -> str:
     for ip in candidates:
         if not _is_allowed_ip(ip):
             raise OutboundURLPolicyError(
-                "URL host is not allowed. Public hosts and 10.8.0.0/24 are allowed."
+                "URL host is not allowed. Public hosts, loopback, and 10.8.0.0/24 are allowed."
             )
 
     return value
 
 
 def ensure_outbound_url_allowed(url: str, field_name: str = "URL") -> str:
-    """Validate a URL and raise ValueError with a field-specific message.
+    """Validate an integration URL and raise a field-specific error.
 
-    OpenHAB is the sole integration allowed to target the local loopback
-    interface; other integrations keep the stricter outbound URL policy.
+    Lightning Goats integrations are allowed to target local services via
+    literal loopback addresses or exact ``localhost``. Arbitrary private
+    networks remain blocked except for the explicitly allowed WireGuard subnet,
+    and DNS names that resolve to loopback/private addresses are still rejected.
     """
 
-    allow_loopback = field_name.strip().lower() == "openhab url"
-
     try:
-        return validate_outbound_url(url, allow_loopback=allow_loopback)
+        return validate_outbound_url(url, allow_loopback=True)
     except OutboundURLPolicyError as exc:
         raise OutboundURLPolicyError(f"Invalid {field_name}: {exc}") from exc
