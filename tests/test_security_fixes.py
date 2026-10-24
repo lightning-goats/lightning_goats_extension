@@ -76,10 +76,10 @@ def test_outbound_url_policy_allows_hostname_resolving_to_public(monkeypatch):
     )
 
 
-def test_stop_unregisters_invoice_listener_and_cancels_tasks():
-    from lnbits.tasks import invoice_listeners
-
-    invoice_listeners[tasks.INVOICE_LISTENER_NAME] = object()
+def test_stop_unregisters_invoice_listener_and_cancels_tasks(monkeypatch):
+    import lnbits.tasks as core_tasks
+    invoice_listeners = {tasks.INVOICE_LISTENER_NAME: object()}
+    monkeypatch.setattr(core_tasks, "invoice_listeners", invoice_listeners, raising=False)
 
     class FakeTask:
         def __init__(self):
@@ -311,7 +311,7 @@ def _payment(checking_id):
     )
 
 
-def test_delegates_distribution_when_cyberherd_autosplits_enabled(monkeypatch):
+def test_authorizes_distribution_after_feeder_when_autosplits_enabled(monkeypatch):
     state = {"processed": [], "failed": []}
     transfer_calls = []
     _patch_feeder_path(monkeypatch, state)
@@ -319,20 +319,20 @@ def test_delegates_distribution_when_cyberherd_autosplits_enabled(monkeypatch):
     async def ch_get_settings(user_id):
         return SimpleNamespace(send_splits_enabled=True, herd_wallet="wallet-a")
 
-    async def ch_transfer(settings):
-        transfer_calls.append(settings)
+    async def ch_transfer(user_id, settings=None, *, feeder_triggered=False):
+        transfer_calls.append((user_id, feeder_triggered))
         return {"ok": True, "sats": 0}
 
     monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
     monkeypatch.setattr(
-        "lnbits.extensions.cyberherd.services.send_splits.transfer_herd_balance_to_source",
+        "lnbits.extensions.cyberherd.services.send_splits.maybe_send_splits_for_user",
         ch_transfer,
     )
 
     run(tasks._handle_payment(_payment("c1")))
 
-    # Delegated to cyberherd: LG must NOT distribute, and the feed is a success.
-    assert transfer_calls == []
+    # Successful feeder handling explicitly authorizes CyberHerd distribution.
+    assert transfer_calls == [("user-a", True)]
     assert state["processed"] == ["c1"]
     assert not state["failed"]
 
@@ -401,10 +401,19 @@ def test_feeder_does_not_refire_within_cooldown(monkeypatch):
     monkeypatch.setattr(tasks, "OpenHABService", CountingOpenHAB)
 
     async def ch_get_settings(user_id):
-        # auto-splits on -> LG delegates; the fake balance never drops.
+        # The fake balance stays high while successful distribution is simulated.
         return SimpleNamespace(send_splits_enabled=True, herd_wallet="wallet-a")
 
     monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
+
+    async def ch_distribute(user_id, settings=None, *, feeder_triggered=False):
+        assert feeder_triggered is True
+        return {"ok": True, "sats": 2000}
+
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd.services.send_splits.maybe_send_splits_for_user",
+        ch_distribute,
+    )
 
     run(tasks._handle_payment(_payment("p1")))
     run(tasks._handle_payment(_payment("p2")))

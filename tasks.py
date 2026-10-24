@@ -81,15 +81,12 @@ FEEDER_COOLDOWN_SECONDS = max(
 _last_feed_monotonic: dict[str, float] = {}
 
 
-async def _distribute_herd_balance(user_id: str) -> None:
-    """Distribute the herd wallet balance via cyberherd.
+async def _distribute_herd_balance(user_id: str, payment: Any = None) -> None:
+    """Distribute after the feeder path reports a successful trigger.
 
-    cyberherd runs its own invoice listener that auto-distributes the herd wallet
-    when ``send_splits_enabled`` is True, so we check whether cyberherd is
-    distributing and act accordingly: delegate to it when auto-splits are on, and
-    only distribute ourselves as the fallback when they are off. An already-empty
-    herd wallet ("balance is zero") means something distributed it first and is
-    treated as done, not a failure. Raises RuntimeError on a real failure.
+    CyberHerd's independent invoice listener does not authorize payouts. This
+    helper runs only after a successful feeder request, or while retrying the
+    distribution of a recently successful trigger during its cooldown.
     """
     try:
         from lnbits.extensions.cyberherd.crud import get_settings as get_ch_settings
@@ -98,21 +95,28 @@ async def _distribute_herd_balance(user_id: str) -> None:
         if not ch_settings:
             raise RuntimeError(f"CyberHerd settings not found for user {user_id}")
 
-        if getattr(ch_settings, "send_splits_enabled", False):
-            logger.info(
-                "Lightning Goats: cyberherd auto-splits are enabled; "
-                "delegating herd distribution to cyberherd"
-            )
-            return
+        if payment is not None:
+            from lnbits.extensions.cyberherd.services.payment_coordinator import get_payment_coordinator
+            coordinator = get_payment_coordinator(user_id=user_id)
+            await coordinator.sync_payment_for_distribution(payment, settings=ch_settings)
+        source_wallet = getattr(ch_settings, "source_wallet", None)
+        if source_wallet:
+            from lnbits.extensions.cyberherd.services.splits import update_split_targets_proportional
+            await update_split_targets_proportional(source_wallet, user_id=user_id, strict=True)
 
         from lnbits.extensions.cyberherd.services.send_splits import (
+            maybe_send_splits_for_user,
             transfer_herd_balance_to_source,
         )
 
-        logger.info(
-            "Lightning Goats: cyberherd auto-splits disabled; distributing herd balance directly"
-        )
-        result = await transfer_herd_balance_to_source(ch_settings)
+        if getattr(ch_settings, "send_splits_enabled", False):
+            result = await maybe_send_splits_for_user(
+                user_id, ch_settings, feeder_triggered=True
+            )
+            if result is None:
+                raise RuntimeError("CyberHerd distribution is not ready; retry required")
+        else:
+            result = await transfer_herd_balance_to_source(ch_settings)
         if result.get("ok"):
             logger.info(
                 f"Lightning Goats: CyberHerd distribution complete: {result.get('sats')} sats"
@@ -594,7 +598,7 @@ async def _handle_payment(payment: Any) -> None:
                         f"Lightning Goats: feeder cooldown active "
                         f"({FEEDER_COOLDOWN_SECONDS}s); skipping feeder, retrying distribution"
                     )
-                    await _distribute_herd_balance(wallet.user)
+                    await _distribute_herd_balance(wallet.user, payment=payment)
                 else:
                     # Trigger feeder
                     if await openhab.trigger_feeder(settings.openhab_feeder_rule_id):
@@ -610,7 +614,7 @@ async def _handle_payment(payment: Any) -> None:
                         logger.info(f"Lightning Goats: feeder message sent: {msg_success}")
 
                         # Distribute (or delegate to cyberherd — see helper).
-                        await _distribute_herd_balance(wallet.user)
+                        await _distribute_herd_balance(wallet.user, payment=payment)
                     else:
                         raise RuntimeError("Feeder trigger failed")
 
@@ -835,8 +839,14 @@ async def stop_background_tasks():
 
         invoice_listeners.pop(INVOICE_LISTENER_NAME, None)
         logger.info("Lightning Goats: invoice listener unregistered")
-    except Exception as ex:
-        logger.warning(f"Lightning Goats: failed to unregister invoice listener: {ex}")
+    except ImportError:
+        # Current LNbits stores deprecated queue forwarders in task_manager.
+        from lnbits.tasks import task_manager
+        for name in (INVOICE_LISTENER_NAME + "_invoice_listener",
+                     "forward_" + INVOICE_LISTENER_NAME + "_invoice_listener"):
+            listener = task_manager.get_task(name)
+            if listener is not None:
+                task_manager.cancel_task(listener)
 
     for task in scheduled_tasks:
         if not task.done():
