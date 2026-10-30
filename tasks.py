@@ -72,21 +72,30 @@ def _get_herd_lock(key: str) -> asyncio.Lock:
 # for this many seconds. This prevents the goats being fed repeatedly by
 # successive payments when the balance is not cleared (e.g. a distribution
 # failure leaves it above the trigger) and generally guards against
-# over-feeding. Distribution still runs on cooled-down payments. Set to 0 to
+# over-feeding. Separate payments wait for this cooldown before feeding. Set to 0 to
 # disable. Note: per-process (like the herd locks); a multi-worker deployment
 # would need a shared store, but LNbits runs a single invoice listener.
 FEEDER_COOLDOWN_SECONDS = max(
     0, int(os.getenv("LIGHTNING_GOATS_FEEDER_COOLDOWN_SECONDS", "60"))
 )
+# The OpenHAB owner has a 5-second cooldown. Six seconds allows that
+# cooldown to expire between requests in a single payment's reward burst.
+FEEDER_BATCH_INTERVAL_SECONDS = max(
+    6.0, float(os.getenv("LIGHTNING_GOATS_FEEDER_BATCH_INTERVAL_SECONDS", "6"))
+)
+MAX_FEEDINGS_PER_PAYMENT = 3
 _last_feed_monotonic: dict[str, float] = {}
 
 
-async def _distribute_herd_balance(user_id: str, payment: Any = None) -> None:
+async def _distribute_herd_balance(
+    user_id: str, payment: Any = None, *, amount_sats: int | None = None,
+    feeding_id: str | None = None,
+) -> None:
     """Distribute after the feeder path reports a successful trigger.
 
     CyberHerd's independent invoice listener does not authorize payouts. This
-    helper runs only after a successful feeder request, or while retrying the
-    distribution of a recently successful trigger during its cooldown.
+    helper runs for each funded threshold cycle. The first three cycles per
+    received payment feed the goats; remaining cycles distribute without feeding.
     """
     try:
         from lnbits.extensions.cyberherd.crud import get_settings as get_ch_settings
@@ -111,12 +120,13 @@ async def _distribute_herd_balance(user_id: str, payment: Any = None) -> None:
 
         if getattr(ch_settings, "send_splits_enabled", False):
             result = await maybe_send_splits_for_user(
-                user_id, ch_settings, feeder_triggered=True
+                user_id, ch_settings, feeder_triggered=True,
+                amount_sats=amount_sats, feeding_id=feeding_id
             )
             if result is None:
                 raise RuntimeError("CyberHerd distribution is not ready; retry required")
         else:
-            result = await transfer_herd_balance_to_source(ch_settings)
+            result = await transfer_herd_balance_to_source(ch_settings, amount_sats=amount_sats, feeding_id=feeding_id)
         if result.get("ok"):
             logger.info(
                 f"Lightning Goats: CyberHerd distribution complete: {result.get('sats')} sats"
@@ -137,6 +147,211 @@ async def _distribute_herd_balance(user_id: str, payment: Any = None) -> None:
         raise
     except Exception as e:
         raise RuntimeError(f"Failed to trigger CyberHerd payment: {e}") from e
+
+
+async def _process_feeding_batch(
+    wallet, settings, payment, openhab, origin, *, resume=False
+):
+    """Run threshold cycles under the herd lock, resuming transfers after restart."""
+    from lnbits.extensions.cyberherd.services.treats import key, record, put
+
+    batch_id = key("feeding-batch", wallet.id)
+    batch = await record(batch_id)
+    if resume and (
+        not batch or batch["state"] != "pending" or batch["data"]["origin"] != origin
+    ):
+        return
+    if batch and batch["state"] == "blocked":
+        raise RuntimeError("Feeder outcome uncertain; operator reconciliation required")
+    if not batch or batch["state"] == "complete":
+        fresh = await get_wallet(wallet.id)
+        threshold = settings.feeder_trigger_sats
+        if not isinstance(threshold, int) or threshold <= 0:
+            raise RuntimeError("Feeder threshold must be positive")
+        data = {
+            "index": 0,
+            "origin": origin,
+            "wallet": wallet.id,
+            "payment_hash": getattr(payment, "payment_hash", None),
+            "payment_sats": payment.amount // 1000,
+            "threshold": threshold,
+            "cycles": max(0, fresh.balance_msat // (threshold * 1000)),
+            "last_feed_at": batch["data"].get("last_feed_at", 0) if batch else 0,
+        }
+        await put(batch_id, wallet.user, "feeding-batch", "pending", data)
+    else:
+        data = batch["data"]
+    threshold = data["threshold"]
+    if not isinstance(threshold, int) or threshold <= 0:
+        raise RuntimeError("Feeder threshold must be positive")
+    while True:
+        # Freeze this deposit's budget; later deposits get their own batch and cap.
+        if data["index"] >= data.get("cycles", 0):
+            await put(batch_id, wallet.user, "feeding-batch", "complete", data)
+            if origin != data["origin"]:
+                await _process_feeding_batch(wallet, settings, payment, openhab, origin)
+            return
+        fresh = await get_wallet(wallet.id)
+        feeding_id = key("feed", wallet.id, data["origin"], data["index"])
+        saved = await record(feeding_id)
+        if saved and saved["state"] == "requested":
+            await put(batch_id, wallet.user, "feeding-batch", "blocked", data)
+            raise RuntimeError(
+                "Feeder request outcome uncertain; operator reconciliation required"
+            )
+        if saved and saved["state"] == "complete":
+            data["index"] += 1
+            await put(batch_id, wallet.user, "feeding-batch", "pending", data)
+            continue
+        if not saved:
+            if not fresh or fresh.balance_msat < threshold * 1000:
+                await put(batch_id, wallet.user, "feeding-batch", "complete", data)
+                return
+            if await openhab.is_feeder_override_enabled():
+                return
+            # Extra threshold cycles are distributions only after the third feed.
+            if data["index"] >= MAX_FEEDINGS_PER_PAYMENT:
+                await put(
+                    feeding_id,
+                    wallet.user,
+                    "feeding",
+                    "payout_only",
+                    {"threshold": threshold},
+                    insert=True,
+                )
+                await _distribute_herd_balance(
+                    wallet.user,
+                    payment=payment,
+                    amount_sats=threshold,
+                    feeding_id=feeding_id,
+                )
+                await put(
+                    feeding_id,
+                    wallet.user,
+                    "feeding",
+                    "complete",
+                    {"threshold": threshold},
+                )
+                data["index"] += 1
+                await put(batch_id, wallet.user, "feeding-batch", "pending", data)
+                continue
+            cooldown_key = settings.herd_wallet_id or wallet.id
+            interval = (
+                FEEDER_BATCH_INTERVAL_SECONDS
+                if data["index"] > 0
+                else FEEDER_COOLDOWN_SECONDS
+            )
+            delay = interval - (
+                time.monotonic() - _last_feed_monotonic.get(cooldown_key, 0.0)
+            )
+            persisted_delay = interval - (time.time() - data.get("last_feed_at", 0))
+            delay = min(interval, max(delay, persisted_delay))
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if await openhab.is_feeder_override_enabled():
+                return
+            # Re-read after waiting: never feed money that was withdrawn meanwhile.
+            fresh = await get_wallet(wallet.id)
+            if not fresh or fresh.balance_msat < threshold * 1000:
+                await put(batch_id, wallet.user, "feeding-batch", "complete", data)
+                return
+            await put(
+                feeding_id,
+                wallet.user,
+                "feeding",
+                "requested",
+                {"threshold": threshold},
+                insert=True,
+            )
+            if not await openhab.trigger_feeder(settings.openhab_feeder_rule_id):
+                await put(batch_id, wallet.user, "feeding-batch", "blocked", data)
+                raise RuntimeError("Feeder trigger failed; reconcile before retry")
+            _last_feed_monotonic[cooldown_key] = time.monotonic()
+            from lnbits.extensions.cyberherd import crud as ch_crud
+
+            data["last_feed_at"] = time.time()
+            async with ch_crud.admission_transaction():
+                await put(
+                    feeding_id, wallet.user, "feeding", "fed", {"threshold": threshold}
+                )
+                await put(batch_id, wallet.user, "feeding-batch", "pending", data)
+        if data["index"] == 0:
+            queued = await send_feeder_message(
+                balance_sats=data["cycles"] * threshold,
+                payment_amount=data["payment_sats"],
+                user_id=wallet.user,
+                payment_id=data["origin"],
+                feedings=min(MAX_FEEDINGS_PER_PAYMENT, data["cycles"]),
+                payout_cycles=data["cycles"],
+            )
+            if not queued:
+                raise RuntimeError(
+                    "Feeder notification could not be queued; retry without feeding again"
+                )
+        await _distribute_herd_balance(
+            wallet.user, payment=payment, amount_sats=threshold, feeding_id=feeding_id
+        )
+        await put(
+            feeding_id, wallet.user, "feeding", "complete", {"threshold": threshold}
+        )
+        data["index"] += 1
+        await put(batch_id, wallet.user, "feeding-batch", "pending", data)
+
+
+async def resume_feeding_batches():
+    """Recover funded cycles without replaying confirmed or uncertain feeder actions."""
+    from lnbits.extensions.cyberherd import crud as ch_crud
+    from lnbits.extensions.cyberherd.services.treats import decode
+    from lnbits.core.crud import get_standalone_payment
+    from lnbits.extensions.cyberherd.utils.common import is_extension_enabled_for_user
+
+    while True:
+        rows = await ch_crud.db.fetchall(
+            f"""SELECT * FROM {ch_crud.db.references_schema}delivery_records
+            WHERE kind='feeding-batch' AND state='pending'"""
+        )
+        for row in rows:
+            data = decode(row["payload"])
+            wallet = await get_wallet(data["wallet"])
+            if (
+                not wallet
+                or not await is_extension_enabled_for_user(wallet.user)
+                or not await is_extension_enabled_for_user(
+                    wallet.user, "lightning_goats"
+                )
+            ):
+                continue
+            settings = await get_settings(wallet.user, auto_populate=False)
+            if not settings or settings.herd_wallet_id != wallet.id:
+                continue
+            payment = (
+                await get_standalone_payment(
+                    data["payment_hash"], incoming=True, wallet_id=wallet.id
+                )
+                if data.get("payment_hash")
+                else None
+            )
+            if not payment or not payment.success:
+                continue
+            async with _get_herd_lock(wallet.id):
+                openhab = OpenHABService(settings.openhab_url, settings.openhab_auth)
+                try:
+                    if not await openhab.is_feeder_override_enabled():
+                        await _process_feeding_batch(
+                            wallet,
+                            settings,
+                            payment,
+                            openhab,
+                            data["origin"],
+                            resume=True,
+                        )
+                except Exception:
+                    logger.error(
+                        "Lightning Goats: feeding-cycle recovery deferred; check cycle records"
+                    )
+                finally:
+                    await openhab.close()
+        await asyncio.sleep(10)
 
 
 async def _alert_processing_failure(payment: Any, idempotency_key: str, error: str) -> None:
@@ -576,47 +791,15 @@ async def _handle_payment(payment: Any) -> None:
             # Check override state once for use in feeder and messaging decisions
             override_enabled = await openhab.is_feeder_override_enabled()
 
-            cooldown_key = settings.herd_wallet_id or wallet.id
-
-            # Check if we should trigger feeder
+            # Each full threshold gets a payout cycle; the first three cycles
+            # per received payment also request a feeding.
+            if settings.feeder_trigger_sats <= 0:
+                raise RuntimeError("Feeder threshold must be positive")
             if balance_sats >= settings.feeder_trigger_sats:
-                logger.info(f"Lightning Goats: feeder trigger threshold reached ({balance_sats} >= {settings.feeder_trigger_sats})")
-
-                last_feed = _last_feed_monotonic.get(cooldown_key, 0.0)
-                in_cooldown = (
-                    FEEDER_COOLDOWN_SECONDS > 0
-                    and (time.monotonic() - last_feed) < FEEDER_COOLDOWN_SECONDS
-                )
-
                 if override_enabled:
-                    logger.info("Lightning Goats: OverrideSwitch is ON, skipping feeder trigger and messages")
-                elif in_cooldown:
-                    # We fed recently and the balance is still above the trigger
-                    # (not cleared — e.g. a prior distribution failed). Do NOT
-                    # feed again yet, but still attempt distribution to clear it.
-                    logger.warning(
-                        f"Lightning Goats: feeder cooldown active "
-                        f"({FEEDER_COOLDOWN_SECONDS}s); skipping feeder, retrying distribution"
-                    )
-                    await _distribute_herd_balance(wallet.user, payment=payment)
+                    logger.info("Lightning Goats: OverrideSwitch is ON, skipping feeder")
                 else:
-                    # Trigger feeder
-                    if await openhab.trigger_feeder(settings.openhab_feeder_rule_id):
-                        logger.info("Lightning Goats: feeder triggered successfully")
-                        _last_feed_monotonic[cooldown_key] = time.monotonic()
-
-                        # Send messaging notification with user_id for template selection
-                        msg_success = await send_feeder_message(
-                            balance_sats=balance_sats,
-                            payment_amount=amount_sats,
-                            user_id=wallet.user,
-                        )
-                        logger.info(f"Lightning Goats: feeder message sent: {msg_success}")
-
-                        # Distribute (or delegate to cyberherd — see helper).
-                        await _distribute_herd_balance(wallet.user, payment=payment)
-                    else:
-                        raise RuntimeError("Feeder trigger failed")
+                    await _process_feeding_batch(wallet, settings, payment, openhab, idempotency_key)
 
             elif amount_sats >= settings.minimum_sats:
                 # Send payment received message (if enabled and override is off)
@@ -694,6 +877,7 @@ def start_payment_listener():
         listener = wait_for_paid_invoices(INVOICE_LISTENER_NAME, _handler)
         task = create_permanent_unique_task(INVOICE_LISTENER_TASK_NAME, listener)
         scheduled_tasks.append(task)
+        scheduled_tasks.append(create_permanent_unique_task("ext_lightning_goats_feed_recovery", resume_feeding_batches))
         logger.info(f"Lightning Goats: Payment listener registered as '{INVOICE_LISTENER_NAME}'")
         return listener
     except Exception as e:

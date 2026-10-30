@@ -126,6 +126,7 @@ async def send_feeder_message(
     balance_sats: int,
     payment_amount: int,
     user_id: Optional[str] = None,
+    *, payment_id: str | None = None, feedings: int = 1, payout_cycles: int = 1,
 ):
     """
     Send feeder trigger message via CyberHerd messaging.
@@ -153,13 +154,20 @@ async def send_feeder_message(
             "name": goat_name,
             "new_amount": payment_amount,
             "difference": 0,
-            "difference_message": f"{balance_sats} sats collected and distributed.",
+            "difference_message": (f"Funding {payout_cycles} CyberHerd payout cycle(s)."
+                                   if payment_id else f"{balance_sats} sats collected and distributed."),
         }
 
         # Use CyberHerd's publish_event_message which handles templates + fallback
         websocket_topic = await _resolve_websocket_topic(user_id)
         herd_wallet_id = await _resolve_herd_wallet_id(user_id)
         logger.info(f"Lightning Goats: publishing feeder_triggered message to topic {websocket_topic} for user {user_id}")
+
+        if payment_id and user_id:
+            from lnbits.extensions.cyberherd.services.treats import queue_feeder
+            return await queue_feeder(user_id, herd_wallet_id, payment_id, {
+                **values, "feedings": feedings, "payout_cycles": payout_cycles,
+            }, websocket_topic)
 
         success = await publish_event_message(
             event_type="feeder_triggered",

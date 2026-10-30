@@ -23,6 +23,33 @@ def _reset_feeder_cooldown():
     tasks._last_feed_monotonic.clear()
 
 
+@pytest.fixture(autouse=True)
+def isolated_feeding_records(monkeypatch):
+    """Never access real CyberHerd rows from feeder unit tests."""
+    from contextlib import asynccontextmanager
+    from lnbits.extensions.cyberherd.services import treats
+    from lnbits.extensions.cyberherd import crud
+    stored = {}
+    async def record(identifier):
+        return stored.get(identifier)
+    async def put(identifier, owner, kind, state, data, **kwargs):
+        stored[identifier] = {"id": identifier, "user_id": owner, "kind": kind,
+                              "state": state, "data": dict(data)}
+    @asynccontextmanager
+    async def transaction(**kwargs):
+        yield
+    monkeypatch.setattr(treats, "record", record)
+    monkeypatch.setattr(treats, "put", put)
+    monkeypatch.setattr(crud, "admission_transaction", transaction)
+    monkeypatch.setattr(tasks, "_last_feed_monotonic", {})
+    monkeypatch.setattr(tasks, "FEEDER_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(tasks, "FEEDER_BATCH_INTERVAL_SECONDS", 0)
+    async def no_alert(*args):
+        pass
+    monkeypatch.setattr(tasks, "_alert_processing_failure", no_alert)
+    yield stored
+
+
 def test_outbound_url_policy_allows_public_and_wireguard_urls():
     assert validate_outbound_url("https://example.com/api") == "https://example.com/api"
     assert validate_outbound_url("http://10.8.0.42:8080/rest") == "http://10.8.0.42:8080/rest"
@@ -78,8 +105,10 @@ def test_outbound_url_policy_allows_hostname_resolving_to_public(monkeypatch):
 
 def test_stop_unregisters_invoice_listener_and_cancels_tasks(monkeypatch):
     import lnbits.tasks as core_tasks
-    invoice_listeners = {tasks.INVOICE_LISTENER_NAME: object()}
-    monkeypatch.setattr(core_tasks, "invoice_listeners", invoice_listeners, raising=False)
+    monkeypatch.setattr(core_tasks, "invoice_listeners", {}, raising=False)
+    from lnbits.tasks import invoice_listeners
+
+    invoice_listeners[tasks.INVOICE_LISTENER_NAME] = object()
 
     class FakeTask:
         def __init__(self):
@@ -275,8 +304,9 @@ class _FakeOpenHABTriggers:
 
 
 def _patch_feeder_path(monkeypatch, state):
+    wallet = SimpleNamespace(id="wallet-a", user="user-a", balance_msat=2_000_000)
     async def fake_get_wallet(wallet_id):
-        return SimpleNamespace(id=wallet_id, user="user-a", balance_msat=2_000_000)
+        return wallet
 
     async def fake_get_settings(user_id, auto_populate=True):
         return _lg_settings()
@@ -302,6 +332,7 @@ def _patch_feeder_path(monkeypatch, state):
     monkeypatch.setattr(tasks, "OpenHABService", _FakeOpenHABTriggers)
     monkeypatch.setattr(tasks, "_LG_STARTED_AT", None)
     monkeypatch.setattr(tasks, "_LG_TODAY_START", None)
+    return wallet
 
 
 def _payment(checking_id):
@@ -311,53 +342,29 @@ def _payment(checking_id):
     )
 
 
-def test_authorizes_distribution_after_feeder_when_autosplits_enabled(monkeypatch):
+def test_each_feeding_passes_exact_threshold_and_identity(monkeypatch):
     state = {"processed": [], "failed": []}
-    transfer_calls = []
-    _patch_feeder_path(monkeypatch, state)
-
-    async def ch_get_settings(user_id):
-        return SimpleNamespace(send_splits_enabled=True, herd_wallet="wallet-a")
-
-    async def ch_transfer(user_id, settings=None, *, feeder_triggered=False):
-        transfer_calls.append((user_id, feeder_triggered))
-        return {"ok": True, "sats": 0}
-
-    monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
-    monkeypatch.setattr(
-        "lnbits.extensions.cyberherd.services.send_splits.maybe_send_splits_for_user",
-        ch_transfer,
-    )
-
+    wallet = _patch_feeder_path(monkeypatch, state)
+    transfers = []
+    async def distribute(user_id, **kwargs):
+        transfers.append(kwargs)
+        wallet.balance_msat -= kwargs["amount_sats"] * 1000
+    monkeypatch.setattr(tasks, "_distribute_herd_balance", distribute)
     run(tasks._handle_payment(_payment("c1")))
-
-    # Successful feeder handling explicitly authorizes CyberHerd distribution.
-    assert transfer_calls == [("user-a", True)]
-    assert state["processed"] == ["c1"]
-    assert not state["failed"]
+    assert [t["amount_sats"] for t in transfers] == [1000, 1000]
+    assert len({t["feeding_id"] for t in transfers}) == 2
+    assert state["processed"] == ["c1"] and not state["failed"]
 
 
-def test_zero_balance_distribution_is_not_a_failure(monkeypatch):
+def test_distribution_failure_retains_confirmed_feeding(monkeypatch, isolated_feeding_records):
     state = {"processed": [], "failed": []}
     _patch_feeder_path(monkeypatch, state)
-
-    async def ch_get_settings(user_id):
-        return SimpleNamespace(send_splits_enabled=False, herd_wallet="wallet-a")
-
-    async def ch_transfer(settings):
-        return {"ok": False, "error": "Herd wallet balance is zero"}
-
-    monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
-    monkeypatch.setattr(
-        "lnbits.extensions.cyberherd.services.send_splits.transfer_herd_balance_to_source",
-        ch_transfer,
-    )
-
+    async def distribute(*args, **kwargs):
+        raise RuntimeError("Distribution unavailable")
+    monkeypatch.setattr(tasks, "_distribute_herd_balance", distribute)
     run(tasks._handle_payment(_payment("c2")))
-
-    # An already-empty herd wallet is "already distributed", not a failure.
-    assert state["processed"] == ["c2"]
-    assert not state["failed"]
+    assert not state["processed"] and state["failed"]
+    assert any(r["kind"] == "feeding" and r["state"] == "fed" for r in isolated_feeding_records.values())
 
 
 def test_no_herd_wallet_configured_skips_payment(monkeypatch):
@@ -385,42 +392,31 @@ def test_no_herd_wallet_configured_skips_payment(monkeypatch):
     assert triggered == []
 
 
-def test_feeder_does_not_refire_within_cooldown(monkeypatch):
-    """Feeder cooldown: a second payment arriving right after a feed (within the
-    cooldown window) must not feed the goats again, even though its balance is
-    still above the trigger."""
+def test_feeder_waits_for_cooldown_before_next_cycle(monkeypatch):
     state = {"processed": [], "failed": []}
-    feeds = []
-    _patch_feeder_path(monkeypatch, state)
-
+    wallet = _patch_feeder_path(monkeypatch, state)
+    feeds, waits = [], []
+    clock = [1000.0]
     class CountingOpenHAB(_FakeOpenHABTriggers):
         async def trigger_feeder(self, rule_id):
             feeds.append(rule_id)
             return True
-
+    async def sleep(delay):
+        waits.append(delay)
+        clock[0] += delay
+    async def distribute(user_id, **kwargs):
+        wallet.balance_msat -= kwargs["amount_sats"] * 1000
     monkeypatch.setattr(tasks, "OpenHABService", CountingOpenHAB)
-
-    async def ch_get_settings(user_id):
-        # The fake balance stays high while successful distribution is simulated.
-        return SimpleNamespace(send_splits_enabled=True, herd_wallet="wallet-a")
-
-    monkeypatch.setattr("lnbits.extensions.cyberherd.crud.get_settings", ch_get_settings)
-
-    async def ch_distribute(user_id, settings=None, *, feeder_triggered=False):
-        assert feeder_triggered is True
-        return {"ok": True, "sats": 2000}
-
-    monkeypatch.setattr(
-        "lnbits.extensions.cyberherd.services.send_splits.maybe_send_splits_for_user",
-        ch_distribute,
-    )
-
+    monkeypatch.setattr(tasks, "_distribute_herd_balance", distribute)
+    monkeypatch.setattr(tasks, "FEEDER_COOLDOWN_SECONDS", 60)
+    monkeypatch.setattr(tasks, "FEEDER_BATCH_INTERVAL_SECONDS", 6)
+    monkeypatch.setattr(tasks.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(tasks.time, "time", lambda: clock[0])
+    monkeypatch.setattr(tasks.asyncio, "sleep", sleep)
     run(tasks._handle_payment(_payment("p1")))
-    run(tasks._handle_payment(_payment("p2")))
-
-    assert feeds == ["rule-1"]                    # fed exactly once
-    assert state["processed"] == ["p1", "p2"]     # both handled successfully
-    assert not state["failed"]
+    assert feeds == ["rule-1", "rule-1"]
+    assert waits == [6]
+    assert state["processed"] == ["p1"] and not state["failed"]
 
 
 def test_extra_string_is_not_used_as_preimage(monkeypatch):

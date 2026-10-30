@@ -9,7 +9,7 @@ def test_auto_distribution_uses_successful_feeder_context(monkeypatch):
  config=SimpleNamespace(send_splits_enabled=True)
  calls=[]
  async def settings(owner):return config
- async def distribute(owner,settings=None,*,feeder_triggered=False):
+ async def distribute(owner,settings=None,*,feeder_triggered=False,amount_sats=None,feeding_id=None):
   calls.append((owner,settings,feeder_triggered))
   return {'ok':True,'sats':1000}
  monkeypatch.setattr(crud,'get_settings',settings)

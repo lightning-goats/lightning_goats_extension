@@ -41,6 +41,37 @@ Lightning Goats replaces the standalone `main.nozaps.py` middleware with a nativ
 - Real-time price display on dashboard
 - No additional storage or calculation needed
 
+## Feeding batches and CyberHerd payout cycles
+
+Each full configured threshold in the herd wallet produces one separate transfer
+to the CyberHerd distribution wallet, leaving the remainder in the herd wallet.
+At most three feeder requests are made per received payment; further threshold
+cycles distribute without requesting additional food. There is one durable
+feeder-triggered announcement for the entire payment, using
+`cyberherd_messaging` templates.
+
+With a 1,000-sat threshold:
+
+| Herd balance | Feeder requests | 1,000-sat payout cycles | Remainder |
+| ---: | ---: | ---: | ---: |
+| 1,234 | 1 | 1 | 234 |
+| 2,345 | 2 | 2 | 345 |
+| 3,456 | 3 | 3 | 456 |
+| 4,345 | 3 | 4 | 345 |
+
+Requests within one payment are spaced at least six seconds apart
+(`LIGHTNING_GOATS_FEEDER_BATCH_INTERVAL_SECONDS`, minimum 6). Separate payments
+retain `LIGHTNING_GOATS_FEEDER_COOLDOWN_SECONDS` (default 60). Cooldown timestamps
+and batch progress survive restarts. The override switch pauses processing.
+Confirmed feeder requests resume their recorded transfer without requesting food
+again. An uncertain feeder request blocks the batch for operator reconciliation.
+An accepted OpenHAB rule request is not physical delivery telemetry.
+
+Upgrade CyberHerd and CyberHerd Messaging at the same time, and apply the
+[required SplitPayments companion patch](https://github.com/lightning-goats/cyberherd_extension/blob/main/patches/splitpayments-treat-accounting.patch)
+before restarting LNbits. CyberHerd owns the durable delivery records used by
+feeding recovery; missing delivery storage must not trigger unrecorded actions.
+
 ## Requirements
 
 ### Required Extensions
