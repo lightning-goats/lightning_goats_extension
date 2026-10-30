@@ -27,9 +27,12 @@ def _reset_feeder_cooldown():
 def isolated_feeding_records(monkeypatch):
     """Never access real CyberHerd rows from feeder unit tests."""
     from contextlib import asynccontextmanager
-    from lnbits.extensions.cyberherd.services import treats
+    from lnbits.extensions.cyberherd.services import treats, streams
     from lnbits.extensions.cyberherd import crud
     stored = {}
+    async def no_stream(*args):
+        return None
+    monkeypatch.setattr(streams, "active", no_stream)
     async def record(identifier):
         return stored.get(identifier)
     async def put(identifier, owner, kind, state, data, **kwargs):

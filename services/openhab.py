@@ -124,7 +124,7 @@ class OpenHABService:
         """Return override state, or None when it cannot be determined."""
 
         state = await self.get_item_state(item_name)
-        if state is None:
+        if state not in ("ON", "OFF"):
             return None
         return state == "ON"
     

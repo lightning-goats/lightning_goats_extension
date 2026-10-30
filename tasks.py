@@ -149,6 +149,18 @@ async def _distribute_herd_balance(
         raise RuntimeError(f"Failed to trigger CyberHerd payment: {e}") from e
 
 
+async def _record_batch_outcome(batch_id, owner, state, data):
+    """Commit the batch status and its optional chat notice together."""
+    from lnbits.extensions.cyberherd import crud as ch_crud
+    from lnbits.extensions.cyberherd.services.treats import put
+    from lnbits.extensions.cyberherd.services.chat_updates import queue_feeding_outcome
+
+    async with ch_crud.admission_transaction():
+        await put(batch_id, owner, "feeding-batch", state, data)
+        await queue_feeding_outcome(owner, data, state,
+                                    min(MAX_FEEDINGS_PER_PAYMENT, data["index"]))
+
+
 async def _process_feeding_batch(
     wallet, settings, payment, openhab, origin, *, resume=False
 ):
@@ -187,7 +199,7 @@ async def _process_feeding_batch(
     while True:
         # Freeze this deposit's budget; later deposits get their own batch and cap.
         if data["index"] >= data.get("cycles", 0):
-            await put(batch_id, wallet.user, "feeding-batch", "complete", data)
+            await _record_batch_outcome(batch_id, wallet.user, "complete", data)
             if origin != data["origin"]:
                 await _process_feeding_batch(wallet, settings, payment, openhab, origin)
             return
@@ -195,7 +207,7 @@ async def _process_feeding_batch(
         feeding_id = key("feed", wallet.id, data["origin"], data["index"])
         saved = await record(feeding_id)
         if saved and saved["state"] == "requested":
-            await put(batch_id, wallet.user, "feeding-batch", "blocked", data)
+            await _record_batch_outcome(batch_id, wallet.user, "blocked", data)
             raise RuntimeError(
                 "Feeder request outcome uncertain; operator reconciliation required"
             )
@@ -205,7 +217,7 @@ async def _process_feeding_batch(
             continue
         if not saved:
             if not fresh or fresh.balance_msat < threshold * 1000:
-                await put(batch_id, wallet.user, "feeding-batch", "complete", data)
+                await _record_batch_outcome(batch_id, wallet.user, "complete", data)
                 return
             if await openhab.is_feeder_override_enabled():
                 return
@@ -253,7 +265,7 @@ async def _process_feeding_batch(
             # Re-read after waiting: never feed money that was withdrawn meanwhile.
             fresh = await get_wallet(wallet.id)
             if not fresh or fresh.balance_msat < threshold * 1000:
-                await put(batch_id, wallet.user, "feeding-batch", "complete", data)
+                await _record_batch_outcome(batch_id, wallet.user, "complete", data)
                 return
             await put(
                 feeding_id,
@@ -264,7 +276,7 @@ async def _process_feeding_batch(
                 insert=True,
             )
             if not await openhab.trigger_feeder(settings.openhab_feeder_rule_id):
-                await put(batch_id, wallet.user, "feeding-batch", "blocked", data)
+                await _record_batch_outcome(batch_id, wallet.user, "blocked", data)
                 raise RuntimeError("Feeder trigger failed; reconcile before retry")
             _last_feed_monotonic[cooldown_key] = time.monotonic()
             from lnbits.extensions.cyberherd import crud as ch_crud

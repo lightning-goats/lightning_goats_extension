@@ -326,3 +326,17 @@ Built for the Lightning Goats project by integrating:
 - CyberHerd member management
 - CyberHerd Messaging notification system
 - OpenHAB IoT automation platform
+
+## Stream-chat feeding summaries
+
+Completed and uncertain feeding batches enqueue their recorded outcome through
+CyberHerd's durable message queue in the same transaction as batch state.
+CyberHerd Messaging renders the stream-chat reply and preserves the original
+feeder announcement's conversation. Outcome counts distinguish accepted feeder
+commands and completed funding transfers; they do not claim physical food
+delivery. Per-payment feeder limits, cooldowns and payout cycles are unchanged.
+
+CyberHerd observes the feeder pause switch separately and publishes deduplicated
+kind-1 and stream-chat pause/resume notices. Unknown OpenHAB readings remain
+unknown and cannot announce a false resumption. Local Astro context selects the
+evening foraging/sign-off variation only when a new pause is observed.
